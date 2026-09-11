@@ -47,6 +47,15 @@ class CleanupTests(unittest.TestCase):
         posts = [PostInfo(floor, str(floor), True, "2026-01-01 00:00:00", "頂") for floor in range(1, 6)]
         self.assertEqual([post.floor for post in deletion_candidates(posts, 2)], [3, 2])
 
+    def test_latest_is_selected_by_post_number_not_page_floor(self):
+        posts = [
+            PostInfo(1, "100", True, "2026-01-01 00:00:00", "root"),
+            PostInfo(8, "800", True, "2026-01-02 00:00:00", "old page tail"),
+            PostInfo(140, "1400", True, "2026-01-03 00:00:00", "old page tail"),
+            PostInfo(2, "1500", True, "2026-01-04 00:00:00", "newest reply"),
+        ]
+        self.assertEqual([post.sn for post in deletion_candidates(posts, 1)], ["1400", "800"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -338,9 +338,22 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
 
 
 def deletion_candidates(posts: list[PostInfo], keep_latest_replies: int = 1) -> list[PostInfo]:
-    """Choose owned replies older than the retained newest replies; floor 1 is immutable."""
+    """Choose owned replies older than the retained newest replies; floor 1 is immutable.
+
+    Bahamut may leave non-contiguous/reused-looking floor labels after deletes.
+    The post number (sn) is monotonic across the whole thread, so it is the
+    stable ordering key and cannot mistake a page's last visible post for the
+    thread's latest reply.
+    """
     keep = max(0, int(keep_latest_replies))
-    replies = sorted((post for post in posts if post.floor > 1 and post.owner), key=lambda post: post.floor, reverse=True)
+    def order_key(post: PostInfo) -> tuple[int, int]:
+        try:
+            sn = int(post.sn)
+        except (TypeError, ValueError):
+            sn = -1
+        return sn, post.floor
+
+    replies = sorted((post for post in posts if post.floor > 1 and post.owner), key=order_key, reverse=True)
     return replies[keep:]
 
 
