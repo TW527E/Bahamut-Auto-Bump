@@ -158,14 +158,30 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
 def _first_visible(page: Any, selectors: str):
     for selector in selectors.split(","):
         locator = page.locator(selector.strip()).first
-        if locator.count() and locator.is_visible():
-            return locator
+        try:
+            if locator.count() and locator.evaluate("element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)"):
+                return locator
+        except Exception:
+            continue
     return None
 
 
 def _with_fallback(configured: Any, fallback: str) -> str:
     value = str(configured or "").strip()
     return f"{value}, {fallback}" if value else fallback
+
+
+def _wait_for_dom(page: Any, expression: str, timeout_ms: int) -> bool:
+    """Poll a DOM predicate without Playwright locator.wait_for (Obscura lacks it)."""
+    deadline = time.monotonic() + timeout_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            if page.evaluate(expression):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.25)
+    return False
 
 
 def login(page: Any, config: Config) -> None:
@@ -197,16 +213,18 @@ def login(page: Any, config: Config) -> None:
     password_selector = _with_fallback(selectors.get("password"), "#form-login input[name='password']")
     submit_selector = _with_fallback(selectors.get("login_submit"), "#btn-login")
     try:
-        page.locator("#form-login").wait_for(state="attached", timeout=timeout)
-        page.wait_for_function(
+        ready = _wait_for_dom(
+            page,
             """() => {
               const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
               return visible(document.querySelector('#form-login input[name="userid"]')) &&
                      visible(document.querySelector('#form-login input[name="password"]')) &&
                      visible(document.querySelector('#btn-login'));
             }""",
-            timeout=timeout,
+            timeout,
         )
+        if not ready:
+            raise PlaywrightTimeoutError("login form did not become visible")
     except PlaywrightTimeoutError as exc:
         title = page.title()
         if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
@@ -257,9 +275,8 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-    try:
-        page.locator(selector).first.wait_for(state="attached")
-    except PlaywrightTimeoutError as exc:
+    if not _wait_for_dom(page, f"() => !!document.querySelector({json.dumps(selector)})", int(config.browser.get("navigation_timeout_ms", 30000))):
+        exc = PlaywrightTimeoutError("thread post selector did not become attached")
         raise CannotConfirm("Thread posts did not load in time") from exc
     latest = latest_post_timestamp(page, config, now)
     if is_today(latest, now):
