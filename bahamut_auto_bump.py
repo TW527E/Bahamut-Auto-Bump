@@ -8,8 +8,6 @@ import binascii
 import json
 import logging
 import re
-import socket
-import subprocess
 import sys
 import time
 import urllib.parse
@@ -107,7 +105,11 @@ def taiwan_now(config: Config) -> datetime:
 
 def parse_post_time(raw: str, timezone: ZoneInfo) -> datetime:
     """Parse ISO/HTML datetime or common Bahamut textual timestamps."""
-    value = raw.strip().replace("年", "-").replace("月", "-").replace("日", "")
+    value = raw.strip()
+    textual = re.search(r"\d{4}(?:[-/]\d{2}[-/]\d{2}|年\d{2}月\d{2}日)\s+\d{2}:\d{2}(?::\d{2})?", value)
+    if textual:
+        value = textual.group(0)
+    value = value.replace("年", "-").replace("月", "-").replace("日", "")
     value = re.sub(r"\s+", " ", value)
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
@@ -132,26 +134,59 @@ def is_today(parsed: datetime, now: datetime) -> bool:
     return parsed.astimezone(now.tzinfo).date() == now.date()
 
 
+def _navigate_to_last_page(page: Any, config: Config) -> None:
+    current = urllib.parse.urlparse(str(page.url))
+    current_query = urllib.parse.parse_qs(current.query)
+    current_page = int(current_query.get("page", ["1"])[0])
+    try:
+        hrefs = page.locator("a[href*='page=']").evaluate_all(
+            "links => links.map((link) => link.href).filter(Boolean)"
+        )
+    except Exception as exc:
+        raise CannotConfirm(f"Could not inspect thread pagination: {exc}") from exc
+
+    page_numbers = {current_page}
+    for href in hrefs:
+        parsed = urllib.parse.urlparse(str(href))
+        query = urllib.parse.parse_qs(parsed.query)
+        if parsed.path != current.path:
+            continue
+        if query.get("bsn") != current_query.get("bsn") or query.get("snA") != current_query.get("snA"):
+            continue
+        try:
+            page_numbers.add(int(query.get("page", [""])[0]))
+        except ValueError:
+            continue
+
+    last_page = max(page_numbers)
+    if last_page <= current_page:
+        return
+    current_query["page"] = [str(last_page)]
+    target = urllib.parse.urlunparse(
+        current._replace(query=urllib.parse.urlencode(current_query, doseq=True))
+    )
+    page.goto(target, wait_until="domcontentloaded")
+    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    try:
+        page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+    except Exception as exc:
+        raise CannotConfirm("The last thread page did not load its posts in time") from exc
+
+
 def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config.selectors.get("post_time_selector", "time[datetime], .edittime, .c-post__header time"))
     try:
-        result = page.evaluate(
+        result = page.locator(selector).evaluate_all(
             """
-            ({postSelector, timeSelector}) => {
-              const result = [];
-              const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
-              let post;
-              while ((post = walker.nextNode())) {
-                if (!post.matches(postSelector)) continue;
-                if (!(post.offsetWidth || post.offsetHeight || post.getClientRects().length)) continue;
-                const stamp = post.querySelector(timeSelector);
-                result.push({raw: stamp?.getAttribute('datetime') || stamp?.textContent?.trim() || ''});
-              }
-              return result;
-            }
+            (posts, timeSelector) => posts.map((post) => {
+              const visible = !!(post.offsetWidth || post.offsetHeight || post.getClientRects().length);
+              const time = post.querySelector(timeSelector);
+              return { visible, raw: time?.getAttribute('datetime') || time?.textContent?.trim() || '' };
+            }).filter((item) => item.visible)
             """,
-            {"postSelector": selector, "timeSelector": time_selector},
+            time_selector,
         )
     except Exception as exc:
         raise CannotConfirm(f"Could not inspect post layout: {exc}") from exc
@@ -162,65 +197,17 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
     return parse_post_time(result[-1]["raw"], now.tzinfo)
 
 
-def _first_visible(page: Any, selectors: str) -> str | None:
+def _first_visible(page: Any, selectors: str):
     for selector in selectors.split(","):
-        selector = selector.strip()
-        try:
-            if page.evaluate(
-                """selector => {
-                  const element = document.querySelector(selector);
-                  return !!element && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
-                }""",
-                selector,
-            ):
-                return selector
-        except Exception:
-            continue
+        locator = page.locator(selector.strip()).first
+        if locator.count() and locator.is_visible():
+            return locator
     return None
-
-
-def _fill_dom(page: Any, selector: str, value: str) -> None:
-    page.evaluate(
-        """({selector, value}) => {
-          const element = document.querySelector(selector);
-          if (!element) throw new Error(`Element not found: ${selector}`);
-          const prototype = element.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-          const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-          setter ? setter.call(element, value) : (element.value = value);
-          element.dispatchEvent(new Event('input', {bubbles: true}));
-          element.dispatchEvent(new Event('change', {bubbles: true}));
-        }""",
-        {"selector": selector, "value": value},
-    )
-
-
-def _click_dom(page: Any, selector: str) -> None:
-    page.evaluate(
-        """selector => {
-          const element = document.querySelector(selector);
-          if (!element) throw new Error(`Element not found: ${selector}`);
-          element.click();
-        }""",
-        selector,
-    )
 
 
 def _with_fallback(configured: Any, fallback: str) -> str:
     value = str(configured or "").strip()
     return f"{value}, {fallback}" if value else fallback
-
-
-def _wait_for_dom(page: Any, expression: str, timeout_ms: int) -> bool:
-    """Poll a DOM predicate without Playwright locator.wait_for (Obscura lacks it)."""
-    deadline = time.monotonic() + timeout_ms / 1000
-    while time.monotonic() < deadline:
-        try:
-            if page.evaluate(expression):
-                return True
-        except Exception:
-            pass
-        time.sleep(0.25)
-    return False
 
 
 def login(page: Any, config: Config) -> None:
@@ -241,8 +228,7 @@ def login(page: Any, config: Config) -> None:
                 f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
             )
         top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
-        post_selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-        posts = bool(page.evaluate("selector => document.querySelector(selector) !== null", post_selector))
+        posts = page.locator(str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))).count()
         if not top_login and posts:
             LOG.info("Using authenticated Playwright storage state: %s", storage_state)
             return
@@ -253,18 +239,16 @@ def login(page: Any, config: Config) -> None:
     password_selector = _with_fallback(selectors.get("password"), "#form-login input[name='password']")
     submit_selector = _with_fallback(selectors.get("login_submit"), "#btn-login")
     try:
-        ready = _wait_for_dom(
-            page,
+        page.locator("#form-login").wait_for(state="attached", timeout=timeout)
+        page.wait_for_function(
             """() => {
               const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
               return visible(document.querySelector('#form-login input[name="userid"]')) &&
                      visible(document.querySelector('#form-login input[name="password"]')) &&
                      visible(document.querySelector('#btn-login'));
             }""",
-            timeout,
+            timeout=timeout,
         )
-        if not ready:
-            raise PlaywrightTimeoutError("login form did not become visible")
     except PlaywrightTimeoutError as exc:
         title = page.title()
         if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
@@ -280,9 +264,9 @@ def login(page: Any, config: Config) -> None:
     missing = [name for name, control in (("username", user), ("password", password), ("login_submit", submit)) if not control]
     if missing:
         raise CannotConfirm("Login form layout is not recognized; missing: " + ", ".join(missing))
-    _fill_dom(page, user, str(config.account["username"]))
-    _fill_dom(page, password, str(config.account["password"]))
-    _click_dom(page, submit)
+    user.fill(str(config.account["username"]))
+    password.fill(str(config.account["password"]))
+    submit.click()
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError:
@@ -291,11 +275,11 @@ def login(page: Any, config: Config) -> None:
     otp = _first_visible(page, _with_fallback(selectors.get("totp"), "#input-2sa, input[name='twoStepAuth']"))
     if otp:
         secret = str(config.account["totp_secret"]).replace(" ", "")
-        _fill_dom(page, otp, pyotp.TOTP(secret).now())
+        otp.fill(pyotp.TOTP(secret).now())
         otp_submit = _first_visible(page, _with_fallback(selectors.get("totp_submit"), "#btn-login"))
         if not otp_submit:
             raise CannotConfirm("TOTP field found but its submit control was not found")
-        _click_dom(page, otp_submit)
+        otp_submit.click()
         try:
             page.wait_for_load_state("domcontentloaded", timeout=timeout)
         except PlaywrightTimeoutError:
@@ -315,9 +299,11 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-    if not _wait_for_dom(page, f"() => !!document.querySelector({json.dumps(selector)})", int(config.browser.get("navigation_timeout_ms", 30000))):
-        exc = PlaywrightTimeoutError("thread post selector did not become attached")
+    try:
+        page.locator(selector).first.wait_for(state="attached")
+    except PlaywrightTimeoutError as exc:
         raise CannotConfirm("Thread posts did not load in time") from exc
+    _navigate_to_last_page(page, config)
     latest = latest_post_timestamp(page, config, now)
     if is_today(latest, now):
         LOG.info("Latest post is dated %s; today's bump is already present", latest.isoformat())
@@ -332,23 +318,9 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     submit = _first_visible(page, submit_selector)
     if not editor:
         raise CannotConfirm("Reply editor layout is not recognized")
-    editor_tag = page.evaluate("selector => document.querySelector(selector)?.tagName || ''", editor)
+    editor_tag = editor.evaluate("element => element.tagName")
     if editor_tag == "IFRAME":
-        page.evaluate(
-            """({selector, value}) => {
-              const iframe = document.querySelector(selector);
-              const doc = iframe && iframe.contentDocument;
-              const edit = doc && (doc.getElementsByClassName('editstyle')[0] || doc.body);
-              if (!edit) throw new Error('Bahamut iframe editor is not ready');
-              edit.replaceChildren();
-              value.split('\n').forEach((line, index) => {
-                if (index) edit.appendChild(doc.createElement('br'));
-                edit.appendChild(doc.createTextNode(line));
-              });
-              edit.dispatchEvent(new Event('input', {bubbles: true}));
-            }""",
-            {"selector": editor, "value": body},
-        )
+        page.frame_locator(editor_selector).locator("body").fill(body)
         # The quick-reply controls are injected only after authentication. When
         # their markup changes, submit the same form used by Bahamut's quickPost.
         page.evaluate(
@@ -370,13 +342,14 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     else:
         if not submit:
             raise CannotConfirm("Reply submit control layout is not recognized")
-        _fill_dom(page, editor, body)
-        _click_dom(page, submit)
+        editor.fill(body)
+        submit.click()
     try:
         page.wait_for_load_state("domcontentloaded", timeout=int(config.browser.get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
         LOG.warning("Reply navigation timed out; reloading for verification")
     page.reload(wait_until="domcontentloaded")
+    _navigate_to_last_page(page, config)
     verified = latest_post_timestamp(page, config, now)
     if not is_today(verified, now):
         raise CannotConfirm("Reply was submitted but the latest post could not be verified as today")
@@ -392,89 +365,35 @@ def run_once(config: Config) -> str:
     except ImportError as exc:
         raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
     with sync_playwright() as playwright:
-        engine = str(config.browser.get("engine", "chromium")).lower()
         storage_state = str(config.browser.get("storage_state", "")).strip()
         if storage_state and not Path(storage_state).exists():
             raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
+        launch_options = {
+            "headless": bool(config.browser.get("headless", True)),
+            "channel": str(config.browser.get("channel", "chrome")),
+        }
+        if config.browser.get("executable_path"):
+            launch_options.pop("channel")
+            launch_options["executable_path"] = str(config.browser["executable_path"])
         browser = None
-        obscura_process = None
-        started_obscura = False
         try:
-            if engine == "obscura":
-                binary = str(config.browser.get("obscura_binary", "obscura"))
-                port = int(config.browser.get("obscura_port", 9222))
-                if not _tcp_port_open("127.0.0.1", port):
-                    command = [binary, "serve", "--port", str(port)]
-                    if bool(config.browser.get("obscura_stealth", False)):
-                        command.append("--stealth")
-                    storage_dir = str(config.browser.get("obscura_storage_dir", "")).strip()
-                    if storage_dir:
-                        command.extend(["--storage-dir", storage_dir])
-                    try:
-                        obscura_process = subprocess.Popen(
-                            command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, start_new_session=True
-                        )
-                    except OSError as exc:
-                        raise CannotConfirm(f"Could not start Obscura ({binary!r}): {exc}") from exc
-                    started_obscura = True
-                    if not _wait_for_tcp_port("127.0.0.1", port, int(config.browser.get("obscura_start_timeout_seconds", 20))):
-                        raise CannotConfirm(f"Obscura did not listen on 127.0.0.1:{port}")
-                try:
-                    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
-                except Exception as exc:
-                    raise CannotConfirm(f"Could not connect to Obscura CDP on port {port}: {exc}") from exc
-                contexts = browser.contexts
-                context = contexts[0] if contexts else browser.new_context()
-                if storage_state:
-                    try:
-                        state = json.loads(Path(storage_state).read_text(encoding="utf-8"))
-                        context.add_cookies(state.get("cookies", []))
-                    except Exception as exc:
-                        raise CannotConfirm(f"Could not import cookies into Obscura: {exc}") from exc
-            elif engine in {"chrome", "chromium"}:
-                launch_options = {"headless": bool(config.browser.get("headless", True))}
-                if config.browser.get("executable_path"):
-                    launch_options["executable_path"] = str(config.browser["executable_path"])
-                elif config.browser.get("channel"):
-                    launch_options["channel"] = str(config.browser["channel"])
-                elif engine == "chrome":
-                    launch_options["channel"] = "chrome"
-                browser = playwright.chromium.launch(**launch_options)
-                context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
-                if storage_state:
-                    context_options["storage_state"] = storage_state
-                context = browser.new_context(**context_options)
-            else:
-                raise ConfigError(f"Unsupported browser engine: {engine!r}; use 'obscura', 'chrome', or 'chromium'")
+            browser = playwright.chromium.launch(**launch_options)
+            context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
+            if storage_state:
+                context_options["storage_state"] = storage_state
+            context = browser.new_context(**context_options)
             page = context.new_page()
             login(page, config)
             return inspect_and_maybe_bump(page, config, now)
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
+                raise CannotConfirm(
+                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
+                ) from exc
+            raise
         finally:
             if browser is not None:
                 browser.close()
-            if started_obscura and obscura_process is not None:
-                obscura_process.terminate()
-                try:
-                    obscura_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    obscura_process.kill()
-
-
-def _tcp_port_open(host: str, port: int) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=0.5):
-            return True
-    except OSError:
-        return False
-
-
-def _wait_for_tcp_port(host: str, port: int, timeout_seconds: int) -> bool:
-    deadline = time.monotonic() + timeout_seconds
-    while time.monotonic() < deadline:
-        if _tcp_port_open(host, port):
-            return True
-        time.sleep(0.25)
-    return False
 
 
 def state_path(config: Config) -> Path:
