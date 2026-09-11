@@ -174,6 +174,21 @@ def login(page: Any, config: Config) -> None:
         raise CannotConfirm("pyotp is required; run pip install -r requirements.txt") from exc
     selectors = config.selectors
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if storage_state and Path(storage_state).exists():
+        page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+        page.set_default_timeout(timeout)
+        title = page.title()
+        if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
+            raise CannotConfirm(
+                f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
+            )
+        top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
+        posts = page.locator(str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))).count()
+        if not top_login and posts:
+            LOG.info("Using authenticated Playwright storage state: %s", storage_state)
+            return
+        LOG.warning("Imported storage state is present but no authenticated thread session was detected")
     page.goto(str(selectors.get("login_url", "https://user.gamer.com.tw/login.php")), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
     user_selector = _with_fallback(selectors.get("username"), "#form-login input[name='userid']")
@@ -307,9 +322,15 @@ def run_once(config: Config) -> str:
         launch_options = {"headless": bool(config.browser.get("headless", True))}
         if config.browser.get("executable_path"):
             launch_options["executable_path"] = str(config.browser["executable_path"])
+        storage_state = str(config.browser.get("storage_state", "")).strip()
+        if storage_state and not Path(storage_state).exists():
+            raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
         browser = playwright.chromium.launch(**launch_options)
         try:
-            context = browser.new_context(locale="zh-TW", timezone_id=config.schedule["timezone"])
+            context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
+            if storage_state:
+                context_options["storage_state"] = storage_state
+            context = browser.new_context(**context_options)
             page = context.new_page()
             login(page, config)
             return inspect_and_maybe_bump(page, config, now)

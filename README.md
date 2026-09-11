@@ -6,6 +6,23 @@ Linux 上以無頭 Chromium 每天檢查指定巴哈姆特文章，並在能確�
 
 若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chromium，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
 
+若 VPS 沒有顯示伺服器，可在有瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session：
+
+```sh
+python export_bahamut_session.py --output bahamut-session.json
+chmod 600 bahamut-session.json
+scp bahamut-session.json root@goodvnic:/opt/Bahamut-Auto-Bump/
+```
+
+在 Linux 的 `config.toml` 設定：
+
+```toml
+[browser]
+storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
+```
+
+這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若 VPS 仍看到 `請稍候...`，代表反爬驗證不接受轉移的 session，應改在被允許的網路環境執行，不能靠腳本繞過驗證。
+
 ## 安裝
 
 ```sh

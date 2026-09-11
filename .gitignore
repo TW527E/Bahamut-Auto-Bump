@@ -4,3 +4,4 @@ state.json.tmp
 .venv/
 __pycache__/
 *.pyc
+bahamut-session.json
