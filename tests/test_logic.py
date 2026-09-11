@@ -2,7 +2,7 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from bahamut_auto_bump import parse_post_time
+from bahamut_auto_bump import PostInfo, deletion_candidates, parse_post_time
 
 
 class TimestampTests(unittest.TestCase):
@@ -30,6 +30,22 @@ class TimestampTests(unittest.TestCase):
     def test_bad_timestamp_is_rejected(self):
         with self.assertRaises(Exception):
             parse_post_time("not-a-time", self.tz)
+
+
+class CleanupTests(unittest.TestCase):
+    def test_floor_one_and_newest_reply_are_retained(self):
+        posts = [
+            PostInfo(1, "root", True, "2026-01-01 00:00:00", "root"),
+            PostInfo(2, "old", True, "2026-01-02 00:00:00", "頂"),
+            PostInfo(3, "previous", True, "2026-01-03 00:00:00", "頂"),
+            PostInfo(4, "latest", True, "2026-01-04 00:00:00", "頂"),
+            PostInfo(5, "other-user", False, "2026-01-05 00:00:00", "頂"),
+        ]
+        self.assertEqual([post.sn for post in deletion_candidates(posts, 1)], ["previous", "old"])
+
+    def test_keep_two_replies(self):
+        posts = [PostInfo(floor, str(floor), True, "2026-01-01 00:00:00", "頂") for floor in range(1, 6)]
+        self.assertEqual([post.floor for post in deletion_candidates(posts, 2)], [3, 2])
 
 
 if __name__ == "__main__":

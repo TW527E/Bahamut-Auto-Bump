@@ -47,6 +47,35 @@ chmod 600 config.toml
 python bahamut_auto_bump.py --config config.toml --once
 ```
 
+## 自動清理舊頂文
+
+腳本可保留一樓與最新的幾筆回覆，並刪除更早、且屬於目前登入帳號的回覆。一樓永遠不會列入刪除候選。刪除動作每筆至少間隔 5 秒；自動頂文則會在新頂文重新載入確認成功後等待 5 秒，再嘗試刪除上一筆舊頂文。
+
+先使用 dry-run 查看候選樓層，不會修改文章：
+
+```sh
+python bahamut_auto_bump.py --config config.toml --cleanup --cleanup-limit 1
+```
+
+確認候選正確後，才使用 `--apply` 執行刪除。建議先限制一筆，逐次觀察日誌與文章頁面：
+
+```sh
+python bahamut_auto_bump.py --config config.toml --cleanup --apply --cleanup-limit 1
+```
+
+設定檔中的 `[cleanup]` 可控制常駐服務行為：
+
+```toml
+[cleanup]
+enabled = true
+dry_run = false
+keep_latest_replies = 1
+interval_seconds = 5
+after_bump_delay_seconds = 5
+```
+
+若要先讓常駐服務只觀察、不刪除，保留 `dry_run = true`。腳本會攔截巴哈姆特頁面自己的 `pdel` 參數並檢查文章擁有權；無法取得樓層、文章編號或站方刪文參數時會停止，不會猜測刪除網址。
+
 執行端固定使用系統安裝的正式 Google Chrome：
 
 ```toml
