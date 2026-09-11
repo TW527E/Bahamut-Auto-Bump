@@ -11,16 +11,16 @@ content_template = "頂🆙！\n（{timestamp}）"
 [selectors]
 # Keep these configurable because Bahamut may change its markup.
 login_url = "https://user.gamer.com.tw/login.php"
-username = "input[name='userid'], input[name='account'], input[type='email']"
-password = "input[name='password'], input[type='password']"
-totp = "input[name='otp'], input[name='code'], input[autocomplete='one-time-code']"
-login_submit = "button[type='submit'], input[type='submit']"
-totp_submit = "button[type='submit'], input[type='submit']"
+username = "#form-login input[name='userid']"
+password = "#form-login input[name='password']"
+totp = "#input-2sa, input[name='twoStepAuth']"
+login_submit = "#btn-login"
+totp_submit = "#btn-login, button[type='submit'], input[type='submit']"
 logout = "a[href*='logout'], [data-action='logout']"
-post_selector = "article.c-post, [data-post-id], .c-post"
-post_time_selector = "time[datetime], .edittime, .c-post__header time"
-editor = "textarea[name='content'], textarea"
-post_submit = "button[type='submit'], input[type='submit']"
+post_selector = "#BH-master > section[id^='post_'] .c-post"
+post_time_selector = ".edittime"
+editor = "#editor"
+post_submit = "[data-action='quick-post'], #quick-post, button[type='submit']"
 
 [browser]
 headless = true

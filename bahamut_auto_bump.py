@@ -131,7 +131,7 @@ def is_today(parsed: datetime, now: datetime) -> bool:
 
 
 def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
-    selector = str(config.selectors.get("post_selector", "article.c-post, [data-post-id], .c-post"))
+    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config.selectors.get("post_time_selector", "time[datetime], .edittime, .c-post__header time"))
     try:
         result = page.locator(selector).evaluate_all(
@@ -171,9 +171,9 @@ def login(page: Any, config: Config) -> None:
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
     page.goto(str(selectors.get("login_url", "https://user.gamer.com.tw/login.php")), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
-    user = _first_visible(page, str(selectors.get("username", "input[name='userid'], input[name='account'], input[type='email']")))
-    password = _first_visible(page, str(selectors.get("password", "input[name='password'], input[type='password']")))
-    submit = _first_visible(page, str(selectors.get("login_submit", "button[type='submit'], input[type='submit']")))
+    user = _first_visible(page, str(selectors.get("username", "#form-login input[name='userid']")))
+    password = _first_visible(page, str(selectors.get("password", "#form-login input[name='password']")))
+    submit = _first_visible(page, str(selectors.get("login_submit", "#btn-login")))
     if not user or not password or not submit:
         raise CannotConfirm("Login form layout is not recognized")
     user.fill(str(config.account["username"]))
@@ -184,11 +184,11 @@ def login(page: Any, config: Config) -> None:
     except PlaywrightTimeoutError:
         LOG.warning("Login navigation timed out; checking visible state")
 
-    otp = _first_visible(page, str(selectors.get("totp", "input[name='otp'], input[name='code'], input[autocomplete='one-time-code']")))
+    otp = _first_visible(page, str(selectors.get("totp", "#input-2sa, input[name='twoStepAuth']")))
     if otp:
         secret = str(config.account["totp_secret"]).replace(" ", "")
         otp.fill(pyotp.TOTP(secret).now())
-        otp_submit = _first_visible(page, str(selectors.get("totp_submit", "button[type='submit'], input[type='submit']")))
+        otp_submit = _first_visible(page, str(selectors.get("totp_submit", "#btn-login, button[type='submit'], input[type='submit']")))
         if not otp_submit:
             raise CannotConfirm("TOTP field found but its submit control was not found")
         otp_submit.click()
@@ -198,7 +198,7 @@ def login(page: Any, config: Config) -> None:
             LOG.warning("TOTP navigation timed out; checking visible state")
 
     logout = str(selectors.get("logout", "a[href*='logout'], [data-action='logout']"))
-    login_form = str(selectors.get("password", "input[name='password'], input[type='password']"))
+    login_form = str(selectors.get("password", "#form-login input[name='password']"))
     if not _first_visible(page, logout) and _first_visible(page, login_form):
         raise CannotConfirm("Login did not reach an authenticated state")
 
@@ -210,7 +210,7 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         raise CannotConfirm("Playwright is required; run pip install -r requirements.txt") from exc
     page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
-    selector = str(config.selectors.get("post_selector", "article.c-post, [data-post-id], .c-post"))
+    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
         page.locator(selector).first.wait_for(state="attached")
     except PlaywrightTimeoutError as exc:
@@ -223,12 +223,38 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     body = str(config.thread.get("content_template", "頂🆙！\n（{timestamp}）")).format(
         timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     )
-    editor = _first_visible(page, str(config.selectors.get("editor", "textarea[name='content'], textarea")))
-    submit = _first_visible(page, str(config.selectors.get("post_submit", "button[type='submit'], input[type='submit']")))
-    if not editor or not submit:
-        raise CannotConfirm("Reply form layout is not recognized")
-    editor.fill(body)
-    submit.click()
+    editor_selector = str(config.selectors.get("editor", "#editor"))
+    submit_selector = str(config.selectors.get("post_submit", "[data-action='quick-post'], #quick-post, button[type='submit']"))
+    editor = _first_visible(page, editor_selector)
+    submit = _first_visible(page, submit_selector)
+    if not editor:
+        raise CannotConfirm("Reply editor layout is not recognized")
+    editor_tag = editor.evaluate("element => element.tagName")
+    if editor_tag == "IFRAME":
+        page.frame_locator(editor_selector).locator("body").fill(body)
+        # The quick-reply controls are injected only after authentication. When
+        # their markup changes, submit the same form used by Bahamut's quickPost.
+        page.evaluate(
+            """
+            (editorSelector) => {
+              const iframe = document.querySelector(editorSelector);
+              const doc = iframe && iframe.contentDocument;
+              const edit = doc && doc.getElementsByClassName('editstyle')[0];
+              const form = document.forms.frm;
+              const target = form && form.elements.rtecontent;
+              if (!edit || !form || !target) throw new Error('Bahamut editor form is not ready');
+              target.value = typeof Bahacode === 'function' ? new Bahacode(edit).convert() : edit.innerHTML;
+              if (window.bahaRte) window.bahaRte.onpost = 1;
+              form.submit();
+            }
+            """,
+            editor_selector,
+        )
+    else:
+        if not submit:
+            raise CannotConfirm("Reply submit control layout is not recognized")
+        editor.fill(body)
+        submit.click()
     try:
         page.wait_for_load_state("domcontentloaded", timeout=int(config.browser.get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
