@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import argparse
-import binascii
 import json
 import logging
 import re
@@ -33,10 +32,6 @@ class CannotConfirm(RuntimeError):
 @dataclass(frozen=True)
 class Config:
     values: dict[str, Any]
-
-    @property
-    def account(self) -> dict[str, Any]:
-        return self.values["account"]
 
     @property
     def thread(self) -> dict[str, Any]:
@@ -85,12 +80,12 @@ def load_config(path: Path) -> Config:
     except tomllib.TOMLDecodeError as exc:
         raise ConfigError(f"Invalid TOML in {path}: {exc}") from exc
 
-    for section in ("account", "thread", "selectors", "browser", "schedule", "telegram"):
+    for section in ("thread", "selectors", "browser", "schedule", "telegram"):
         if not isinstance(data.get(section), dict):
             raise ConfigError(f"Missing [{section}] section")
     required = {
-        "account": ("username", "password", "totp_secret"),
         "thread": ("url",),
+        "browser": ("storage_state",),
         "schedule": ("timezone", "time", "retry_interval_seconds"),
         "telegram": ("bot_token", "target_chat_id", "admin_chat_id"),
     }
@@ -103,12 +98,8 @@ def load_config(path: Path) -> Config:
         datetime.strptime(data["schedule"]["time"], "%H:%M")
         if int(data["schedule"]["retry_interval_seconds"]) < 30:
             raise ConfigError("retry_interval_seconds must be at least 30")
-        import pyotp
-        pyotp.TOTP(data["account"]["totp_secret"].replace(" ", "")).now()
-    except ImportError as exc:
-        raise ConfigError("pyotp is required; run pip install -r requirements.txt") from exc
-    except (KeyError, ValueError, TypeError, binascii.Error) as exc:
-        raise ConfigError(f"Invalid schedule or TOTP setting: {exc}") from exc
+    except (KeyError, ValueError, TypeError) as exc:
+        raise ConfigError(f"Invalid schedule setting: {exc}") from exc
     return Config(data)
 
 
@@ -477,90 +468,29 @@ def _first_visible(page: Any, selectors: str):
     return None
 
 
-def _with_fallback(configured: Any, fallback: str) -> str:
-    value = str(configured or "").strip()
-    return f"{value}, {fallback}" if value else fallback
-
-
-def login(page: Any, config: Config) -> None:
-    try:
-        import pyotp
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
-    except ImportError as exc:
-        raise CannotConfirm("pyotp is required; run pip install -r requirements.txt") from exc
-    selectors = config.selectors
+def verify_imported_session(page: Any, config: Config) -> None:
+    """Require an imported authenticated session; never enter credentials."""
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
     storage_state = str(config.browser.get("storage_state", "")).strip()
-    if storage_state and Path(storage_state).exists():
-        page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
-        page.set_default_timeout(timeout)
-        title = page.title()
-        if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
-            raise CannotConfirm(
-                f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
-            )
-        top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
-        posts = page.locator(str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))).count()
-        if not top_login and posts:
-            LOG.info("Using authenticated Playwright storage state: %s", storage_state)
-            return
-        LOG.warning("Imported storage state is present but no authenticated thread session was detected")
-    page.goto(str(selectors.get("login_url", "https://user.gamer.com.tw/login.php")), wait_until="domcontentloaded")
+    if not storage_state:
+        raise CannotConfirm("browser.storage_state is required; automatic account/password login is disabled")
+    if not Path(storage_state).exists():
+        raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
+    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
-    user_selector = _with_fallback(selectors.get("username"), "#form-login input[name='userid']")
-    password_selector = _with_fallback(selectors.get("password"), "#form-login input[name='password']")
-    submit_selector = _with_fallback(selectors.get("login_submit"), "#btn-login")
-    try:
-        page.locator("#form-login").wait_for(state="attached", timeout=timeout)
-        page.wait_for_function(
-            """() => {
-              const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-              return visible(document.querySelector('#form-login input[name="userid"]')) &&
-                     visible(document.querySelector('#form-login input[name="password"]')) &&
-                     visible(document.querySelector('#btn-login'));
-            }""",
-            timeout=timeout,
-        )
-    except PlaywrightTimeoutError as exc:
-        title = page.title()
-        if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
-            raise CannotConfirm(
-                f"Bahamut anti-bot challenge blocked the headless browser; url={page.url!r}, title={title!r}"
-            ) from exc
+    title = page.title()
+    if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
         raise CannotConfirm(
-            f"Login page did not render #form-login; url={page.url!r}, title={title!r}"
-        ) from exc
-    user = _first_visible(page, user_selector)
-    password = _first_visible(page, password_selector)
-    submit = _first_visible(page, submit_selector)
-    missing = [name for name, control in (("username", user), ("password", password), ("login_submit", submit)) if not control]
-    if missing:
-        raise CannotConfirm("Login form layout is not recognized; missing: " + ", ".join(missing))
-    user.fill(str(config.account["username"]))
-    password.fill(str(config.account["password"]))
-    submit.click()
-    try:
-        page.wait_for_load_state("domcontentloaded", timeout=timeout)
-    except PlaywrightTimeoutError:
-        LOG.warning("Login navigation timed out; checking visible state")
-
-    otp = _first_visible(page, _with_fallback(selectors.get("totp"), "#input-2sa, input[name='twoStepAuth']"))
-    if otp:
-        secret = str(config.account["totp_secret"]).replace(" ", "")
-        otp.fill(pyotp.TOTP(secret).now())
-        otp_submit = _first_visible(page, _with_fallback(selectors.get("totp_submit"), "#btn-login"))
-        if not otp_submit:
-            raise CannotConfirm("TOTP field found but its submit control was not found")
-        otp_submit.click()
-        try:
-            page.wait_for_load_state("domcontentloaded", timeout=timeout)
-        except PlaywrightTimeoutError:
-            LOG.warning("TOTP navigation timed out; checking visible state")
-
-    logout = str(selectors.get("logout", "a[href*='logout'], [data-action='logout']"))
-    login_form = str(selectors.get("password", "#form-login input[name='password']"))
-    if not _first_visible(page, logout) and _first_visible(page, login_form):
-        raise CannotConfirm("Login did not reach an authenticated state")
+            f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
+        )
+    top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
+    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    posts = page.locator(selector).count()
+    if top_login or not posts:
+        raise CannotConfirm(
+            "Imported browser storage_state is expired or not authenticated; export a new session manually"
+        )
+    LOG.info("Using authenticated Playwright storage state: %s", storage_state)
 
 
 def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
@@ -683,7 +613,7 @@ def run_once(config: Config) -> str:
                 context_options["storage_state"] = storage_state
             context = browser.new_context(**context_options)
             page = context.new_page()
-            login(page, config)
+            verify_imported_session(page, config)
             return inspect_and_maybe_bump(page, config, now)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
@@ -721,7 +651,7 @@ def run_cleanup(config: Config, max_deletions: int = 0) -> int:
                 context_options["storage_state"] = storage_state
             context = browser.new_context(**context_options)
             page = context.new_page()
-            login(page, config)
+            verify_imported_session(page, config)
             return cleanup_thread(page, config, max_deletions=max_deletions)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
@@ -846,7 +776,7 @@ class TelegramNotifier:
 
 def notification_kind(exc: Exception) -> str:
     message = str(exc).lower()
-    if any(word in message for word in ("login", "totp", "authenticated", "登入")):
+    if any(word in message for word in ("login", "cookie", "session", "authenticated", "登入")):
         return "auth"
     if any(word in message for word in ("layout", "selector", "timestamp", "post containers", "樓層")):
         return "layout"
