@@ -40,6 +40,16 @@ time = "09:00"
 retry_interval_seconds = 900
 state_file = "state.json"
 
+[cleanup]
+# Keep floor 1 forever. Set enabled=true to remove the previous bump after a
+# newly submitted bump has been verified. Live deletion requires dry_run=false
+# (or the explicit --apply flag for --cleanup).
+enabled = false
+dry_run = true
+keep_latest_replies = 1
+interval_seconds = 5
+after_bump_delay_seconds = 5
+
 [telegram]
 # Create a bot with @BotFather. Add it as an administrator of the target
 # channel so it can publish messages. Channel ids usually look like -100....
