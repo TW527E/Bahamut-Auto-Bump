@@ -136,15 +136,22 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config.selectors.get("post_time_selector", "time[datetime], .edittime, .c-post__header time"))
     try:
-        result = page.locator(selector).evaluate_all(
+        result = page.evaluate(
             """
-            (posts, timeSelector) => posts.map((post) => {
-              const visible = !!(post.offsetWidth || post.offsetHeight || post.getClientRects().length);
-              const time = post.querySelector(timeSelector);
-              return { visible, raw: time?.getAttribute('datetime') || time?.textContent?.trim() || '' };
-            }).filter((item) => item.visible)
+            ({postSelector, timeSelector}) => {
+              const result = [];
+              const walker = document.createTreeWalker(document.documentElement, NodeFilter.SHOW_ELEMENT);
+              let post;
+              while ((post = walker.nextNode())) {
+                if (!post.matches(postSelector)) continue;
+                if (!(post.offsetWidth || post.offsetHeight || post.getClientRects().length)) continue;
+                const stamp = post.querySelector(timeSelector);
+                result.push({raw: stamp?.getAttribute('datetime') || stamp?.textContent?.trim() || ''});
+              }
+              return result;
+            }
             """,
-            time_selector,
+            {"postSelector": selector, "timeSelector": time_selector},
         )
     except Exception as exc:
         raise CannotConfirm(f"Could not inspect post layout: {exc}") from exc
@@ -155,15 +162,47 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
     return parse_post_time(result[-1]["raw"], now.tzinfo)
 
 
-def _first_visible(page: Any, selectors: str):
+def _first_visible(page: Any, selectors: str) -> str | None:
     for selector in selectors.split(","):
-        locator = page.locator(selector.strip()).first
+        selector = selector.strip()
         try:
-            if locator.count() and locator.evaluate("element => !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length)"):
-                return locator
+            if page.evaluate(
+                """selector => {
+                  const element = document.querySelector(selector);
+                  return !!element && !!(element.offsetWidth || element.offsetHeight || element.getClientRects().length);
+                }""",
+                selector,
+            ):
+                return selector
         except Exception:
             continue
     return None
+
+
+def _fill_dom(page: Any, selector: str, value: str) -> None:
+    page.evaluate(
+        """({selector, value}) => {
+          const element = document.querySelector(selector);
+          if (!element) throw new Error(`Element not found: ${selector}`);
+          const prototype = element.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+          setter ? setter.call(element, value) : (element.value = value);
+          element.dispatchEvent(new Event('input', {bubbles: true}));
+          element.dispatchEvent(new Event('change', {bubbles: true}));
+        }""",
+        {"selector": selector, "value": value},
+    )
+
+
+def _click_dom(page: Any, selector: str) -> None:
+    page.evaluate(
+        """selector => {
+          const element = document.querySelector(selector);
+          if (!element) throw new Error(`Element not found: ${selector}`);
+          element.click();
+        }""",
+        selector,
+    )
 
 
 def _with_fallback(configured: Any, fallback: str) -> str:
@@ -202,7 +241,8 @@ def login(page: Any, config: Config) -> None:
                 f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
             )
         top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
-        posts = page.locator(str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))).count()
+        post_selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+        posts = bool(page.evaluate("selector => document.querySelector(selector) !== null", post_selector))
         if not top_login and posts:
             LOG.info("Using authenticated Playwright storage state: %s", storage_state)
             return
@@ -240,9 +280,9 @@ def login(page: Any, config: Config) -> None:
     missing = [name for name, control in (("username", user), ("password", password), ("login_submit", submit)) if not control]
     if missing:
         raise CannotConfirm("Login form layout is not recognized; missing: " + ", ".join(missing))
-    user.fill(str(config.account["username"]))
-    password.fill(str(config.account["password"]))
-    submit.click()
+    _fill_dom(page, user, str(config.account["username"]))
+    _fill_dom(page, password, str(config.account["password"]))
+    _click_dom(page, submit)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=timeout)
     except PlaywrightTimeoutError:
@@ -251,11 +291,11 @@ def login(page: Any, config: Config) -> None:
     otp = _first_visible(page, _with_fallback(selectors.get("totp"), "#input-2sa, input[name='twoStepAuth']"))
     if otp:
         secret = str(config.account["totp_secret"]).replace(" ", "")
-        otp.fill(pyotp.TOTP(secret).now())
+        _fill_dom(page, otp, pyotp.TOTP(secret).now())
         otp_submit = _first_visible(page, _with_fallback(selectors.get("totp_submit"), "#btn-login"))
         if not otp_submit:
             raise CannotConfirm("TOTP field found but its submit control was not found")
-        otp_submit.click()
+        _click_dom(page, otp_submit)
         try:
             page.wait_for_load_state("domcontentloaded", timeout=timeout)
         except PlaywrightTimeoutError:
@@ -292,9 +332,23 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     submit = _first_visible(page, submit_selector)
     if not editor:
         raise CannotConfirm("Reply editor layout is not recognized")
-    editor_tag = editor.evaluate("element => element.tagName")
+    editor_tag = page.evaluate("selector => document.querySelector(selector)?.tagName || ''", editor)
     if editor_tag == "IFRAME":
-        page.frame_locator(editor_selector).locator("body").fill(body)
+        page.evaluate(
+            """({selector, value}) => {
+              const iframe = document.querySelector(selector);
+              const doc = iframe && iframe.contentDocument;
+              const edit = doc && (doc.getElementsByClassName('editstyle')[0] || doc.body);
+              if (!edit) throw new Error('Bahamut iframe editor is not ready');
+              edit.replaceChildren();
+              value.split('\n').forEach((line, index) => {
+                if (index) edit.appendChild(doc.createElement('br'));
+                edit.appendChild(doc.createTextNode(line));
+              });
+              edit.dispatchEvent(new Event('input', {bubbles: true}));
+            }""",
+            {"selector": editor, "value": body},
+        )
         # The quick-reply controls are injected only after authentication. When
         # their markup changes, submit the same form used by Bahamut's quickPost.
         page.evaluate(
@@ -316,8 +370,8 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     else:
         if not submit:
             raise CannotConfirm("Reply submit control layout is not recognized")
-        editor.fill(body)
-        submit.click()
+        _fill_dom(page, editor, body)
+        _click_dom(page, submit)
     try:
         page.wait_for_load_state("domcontentloaded", timeout=int(config.browser.get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
