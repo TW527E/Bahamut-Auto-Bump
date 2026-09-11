@@ -191,8 +191,13 @@ def login(page: Any, config: Config) -> None:
             timeout=timeout,
         )
     except PlaywrightTimeoutError as exc:
+        title = page.title()
+        if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
+            raise CannotConfirm(
+                f"Bahamut anti-bot challenge blocked the headless browser; url={page.url!r}, title={title!r}"
+            ) from exc
         raise CannotConfirm(
-            f"Login page did not render #form-login; url={page.url!r}, title={page.title()!r}"
+            f"Login page did not render #form-login; url={page.url!r}, title={title!r}"
         ) from exc
     user = _first_visible(page, user_selector)
     password = _first_visible(page, password_selector)
