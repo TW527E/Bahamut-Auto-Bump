@@ -161,6 +161,11 @@ def _first_visible(page: Any, selectors: str):
     return None
 
 
+def _with_fallback(configured: Any, fallback: str) -> str:
+    value = str(configured or "").strip()
+    return f"{value}, {fallback}" if value else fallback
+
+
 def login(page: Any, config: Config) -> None:
     try:
         import pyotp
@@ -171,11 +176,12 @@ def login(page: Any, config: Config) -> None:
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
     page.goto(str(selectors.get("login_url", "https://user.gamer.com.tw/login.php")), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
-    user = _first_visible(page, str(selectors.get("username", "#form-login input[name='userid']")))
-    password = _first_visible(page, str(selectors.get("password", "#form-login input[name='password']")))
-    submit = _first_visible(page, str(selectors.get("login_submit", "#btn-login")))
-    if not user or not password or not submit:
-        raise CannotConfirm("Login form layout is not recognized")
+    user = _first_visible(page, _with_fallback(selectors.get("username"), "#form-login input[name='userid']"))
+    password = _first_visible(page, _with_fallback(selectors.get("password"), "#form-login input[name='password']"))
+    submit = _first_visible(page, _with_fallback(selectors.get("login_submit"), "#btn-login"))
+    missing = [name for name, control in (("username", user), ("password", password), ("login_submit", submit)) if not control]
+    if missing:
+        raise CannotConfirm("Login form layout is not recognized; missing: " + ", ".join(missing))
     user.fill(str(config.account["username"]))
     password.fill(str(config.account["password"]))
     submit.click()
@@ -184,11 +190,11 @@ def login(page: Any, config: Config) -> None:
     except PlaywrightTimeoutError:
         LOG.warning("Login navigation timed out; checking visible state")
 
-    otp = _first_visible(page, str(selectors.get("totp", "#input-2sa, input[name='twoStepAuth']")))
+    otp = _first_visible(page, _with_fallback(selectors.get("totp"), "#input-2sa, input[name='twoStepAuth']"))
     if otp:
         secret = str(config.account["totp_secret"]).replace(" ", "")
         otp.fill(pyotp.TOTP(secret).now())
-        otp_submit = _first_visible(page, str(selectors.get("totp_submit", "#btn-login, button[type='submit'], input[type='submit']")))
+        otp_submit = _first_visible(page, _with_fallback(selectors.get("totp_submit"), "#btn-login"))
         if not otp_submit:
             raise CannotConfirm("TOTP field found but its submit control was not found")
         otp_submit.click()
