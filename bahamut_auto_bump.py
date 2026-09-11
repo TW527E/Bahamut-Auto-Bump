@@ -352,6 +352,12 @@ def _delete_request(page: Any, sn: str) -> dict[str, str]:
 
 
 def delete_post(page: Any, config: Config, post: PostInfo) -> None:
+    # pdel is generated on thread pages and contains the current delete token.
+    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    page.locator(selector).first.wait_for(
+        state="attached", timeout=int(config.browser.get("navigation_timeout_ms", 30000))
+    )
     request = _delete_request(page, post.sn)
     if request["cookie"]:
         page.evaluate(
@@ -367,6 +373,27 @@ def delete_post(page: Any, config: Config, post: PostInfo) -> None:
         LOG.warning("Delete navigation ended early; verifying the post: %s", exc)
 
 
+def verify_post_deleted(page: Any, config: Config, post: PostInfo) -> None:
+    """Verify one deletion through Bahamut's canonical single-post URL."""
+    thread = urllib.parse.urlparse(str(config.thread["url"]))
+    query = urllib.parse.parse_qs(thread.query)
+    bsn = query.get("bsn", [""])[0]
+    if not bsn:
+        raise CannotConfirm("Thread URL has no bsn for deletion verification")
+    verification_url = urllib.parse.urljoin(
+        str(config.thread["url"]),
+        "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": post.sn}),
+    )
+    page.goto(verification_url, wait_until="domcontentloaded")
+    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    page.locator("body").wait_for(state="attached", timeout=timeout)
+    if page.locator(f"#post_{post.sn}").count():
+        raise CannotConfirm(f"Delete request completed but floor {post.floor} is still present")
+    body_text = page.locator("body").inner_text(timeout=timeout)
+    if "此文章/討論串不存在或已被刪除" not in body_text:
+        raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
+
+
 def cleanup_previous_reply(page: Any, config: Config) -> bool:
     posts = collect_posts(page, config)
     candidates = deletion_candidates(posts, keep_latest_replies=1)
@@ -378,8 +405,7 @@ def cleanup_previous_reply(page: Any, config: Config) -> bool:
         LOG.info("Cleanup dry-run: would delete floor %s (sn=%s)", target.floor, target.sn)
         return False
     delete_post(page, config, target)
-    if any(post.sn == target.sn for post in collect_posts(page, config)):
-        raise CannotConfirm(f"Delete request completed but floor {target.floor} is still present")
+    verify_post_deleted(page, config, target)
     LOG.info("Deleted previous bump floor %s (sn=%s)", target.floor, target.sn)
     return True
 
@@ -401,8 +427,7 @@ def cleanup_thread(page: Any, config: Config, max_deletions: int = 0) -> int:
             LOG.info("Cleanup dry-run: would delete floor %s (sn=%s)", target.floor, target.sn)
         else:
             delete_post(page, config, target)
-            if any(post.sn == target.sn for post in collect_posts(page, config)):
-                raise CannotConfirm(f"Delete request completed but floor {target.floor} is still present")
+            verify_post_deleted(page, config, target)
             deleted += 1
             LOG.info("Deleted floor %s (sn=%s)", target.floor, target.sn)
         if not dry_run and index + 1 < len(candidates):
