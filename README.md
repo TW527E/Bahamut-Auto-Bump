@@ -54,10 +54,10 @@ still stop and retry rather than bypass them.
 ## systemd 常駐服務
 
 ```sh
-sudo useradd --system --home /opt/bahamut-auto-bump --shell /usr/sbin/nologin bahamut-bump
-sudo mkdir -p /opt/bahamut-auto-bump
-sudo cp -a . /opt/bahamut-auto-bump/
-sudo chown -R bahamut-bump:bahamut-bump /opt/bahamut-auto-bump
+sudo useradd --system --home /opt/Bahamut-Auto-Bump --shell /usr/sbin/nologin bahamut-bump
+sudo mkdir -p /opt/Bahamut-Auto-Bump
+sudo cp -a . /opt/Bahamut-Auto-Bump/
+sudo chown -R bahamut-bump:bahamut-bump /opt/Bahamut-Auto-Bump
 sudo install -m 0644 bahamut-auto-bump.service /etc/systemd/system/
 sudo systemctl daemon-reload
 sudo systemctl enable --now bahamut-auto-bump.service
