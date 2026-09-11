@@ -289,7 +289,17 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
         if str(page.url) != page_url:
             page.goto(page_url, wait_until="domcontentloaded")
         try:
-            page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+            posts_locator = page.locator(selector)
+            if posts_locator.count() == 0:
+                # Deleting replies can shrink the final page while an older
+                # pagination link is still present. Since pages are scanned in
+                # ascending order, an empty page after collected posts is a
+                # stale trailing page; an empty first page remains an error.
+                if result:
+                    LOG.info("Reached an empty trailing page after cleanup; stopping at the new last page")
+                    break
+                raise CannotConfirm(f"Thread page has no post containers: {page_url}")
+            posts_locator.first.wait_for(state="attached", timeout=timeout)
             rows = page.locator("section[id^='post_']").evaluate_all(
                 """
                 (sections, timeSelector) => sections.map((section) => {
@@ -311,8 +321,15 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
                 """,
                 time_selector,
             )
+        except CannotConfirm:
+            raise
         except Exception as exc:
-            raise CannotConfirm(f"Could not inspect post layout: {exc}") from exc
+            try:
+                title = page.title()
+                url = page.url
+            except Exception:
+                title, url = "<unavailable>", "<unavailable>"
+            raise CannotConfirm(f"Could not inspect post layout; url={url!r}, title={title!r}: {exc}") from exc
         for row in rows:
             try:
                 floor = int(row["floor"] or (1 if not result else 0))
