@@ -23,22 +23,16 @@ editor = "#editor"
 post_submit = "[data-action='quick-post'], #quick-post, button[type='submit']"
 
 [browser]
-engine = "obscura"
 headless = true
 navigation_timeout_ms = 30000
-# Obscura is a standalone Rust browser; no Chromium binary is needed.
-# obscura_binary = "/opt/obscura/obscura"
-# obscura_port = 9222
-# obscura_storage_dir = "/opt/Bahamut-Auto-Bump/obscura-profile"
-# obscura_stealth = false
-# obscura_start_timeout_seconds = 20
+# Use the system-installed Google Chrome Stable. This does not use or download
+# Playwright's Chromium for Testing build.
+channel = "chrome"
 # Optional Playwright storage state exported by export_bahamut_session.py.
 # Use an absolute path on the Linux host and chmod 600 on this file.
 # storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
-# Optional: set this only when Chromium is installed outside Playwright.
-# executable_path = "/usr/bin/chromium"
-# For a system-installed Google Chrome use engine = "chrome" and:
-# channel = "chrome"
+# Optional explicit path instead of channel detection:
+# executable_path = "/usr/bin/google-chrome-stable"
 
 [schedule]
 timezone = "Asia/Taipei"

@@ -1,10 +1,10 @@
 # Bahamut Auto Bump
 
-Linux 上以 Obscura 或系統安裝的 Google Chrome 每天檢查指定巴哈姆特文章，並在能確認「最新樓層不是今天」時發送一次頂文。時區固定由設定中的 `Asia/Taipei`（UTC+8）決定。
+Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特文章，並在能確認「最新樓層不是今天」時發送一次頂文。時區固定由設定中的 `Asia/Taipei`（UTC+8）決定。
 
 安全行為：登入失敗、TOTP 失敗、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。
 
-若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chromium，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
+若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chrome，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
 
 若 VPS 沒有顯示伺服器，可在有瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
 
@@ -25,7 +25,14 @@ storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 
 ## 安裝
 
+先確認 Linux 主機是 `amd64`，再安裝正式版 Google Chrome。Google 官方沒有提供 Linux `arm64` 的 Chrome Stable 套件；若 `dpkg --print-architecture` 顯示 `arm64`，需改用 x86_64 主機才能採用本方案。
+
 ```sh
+dpkg --print-architecture
+curl -LO https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+sudo apt install ./google-chrome-stable_current_amd64.deb
+google-chrome-stable --version
+
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
@@ -40,26 +47,15 @@ chmod 600 config.toml
 python bahamut_auto_bump.py --config config.toml --once
 ```
 
-## Obscura backend
-
-Set `[browser] engine = "obscura"`. Install an Obscura Linux release binary and
-set `obscura_binary` if it is not on `PATH`; the worker starts `obscura serve`
-and connects over local CDP, so no display server or Chromium is required.
-`obscura_stealth` is off by default. Obscura's own documentation says stealth
-does not solve Cloudflare interactive challenges or CAPTCHAs; this project will
-still stop and retry rather than bypass them.
-
-若要直接使用系統安裝的正式 Google Chrome：
+執行端固定使用系統安裝的正式 Google Chrome：
 
 ```toml
 [browser]
-engine = "chrome"
 channel = "chrome"
-headless = false
+headless = true
 ```
 
-這只使用 Playwright Python API 控制已安裝的 Chrome，不需要執行
-`playwright install chromium`。
+這只使用 Playwright Python API 控制已安裝的 Chrome，不需要也不應執行 `playwright install chromium`。伺服器沒有顯示服務時保持 `headless = true` 即可。
 
 ## systemd 常駐服務
 
