@@ -1,0 +1,2 @@
+playwright>=1.45,<2
+pyotp>=2.9,<3
