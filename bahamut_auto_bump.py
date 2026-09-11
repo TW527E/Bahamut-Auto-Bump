@@ -176,9 +176,27 @@ def login(page: Any, config: Config) -> None:
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
     page.goto(str(selectors.get("login_url", "https://user.gamer.com.tw/login.php")), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
-    user = _first_visible(page, _with_fallback(selectors.get("username"), "#form-login input[name='userid']"))
-    password = _first_visible(page, _with_fallback(selectors.get("password"), "#form-login input[name='password']"))
-    submit = _first_visible(page, _with_fallback(selectors.get("login_submit"), "#btn-login"))
+    user_selector = _with_fallback(selectors.get("username"), "#form-login input[name='userid']")
+    password_selector = _with_fallback(selectors.get("password"), "#form-login input[name='password']")
+    submit_selector = _with_fallback(selectors.get("login_submit"), "#btn-login")
+    try:
+        page.locator("#form-login").wait_for(state="attached", timeout=timeout)
+        page.wait_for_function(
+            """() => {
+              const visible = (el) => !!el && !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+              return visible(document.querySelector('#form-login input[name="userid"]')) &&
+                     visible(document.querySelector('#form-login input[name="password"]')) &&
+                     visible(document.querySelector('#btn-login'));
+            }""",
+            timeout=timeout,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise CannotConfirm(
+            f"Login page did not render #form-login; url={page.url!r}, title={page.title()!r}"
+        ) from exc
+    user = _first_visible(page, user_selector)
+    password = _first_visible(page, password_selector)
+    submit = _first_visible(page, submit_selector)
     missing = [name for name, control in (("username", user), ("password", password), ("login_submit", submit)) if not control]
     if missing:
         raise CannotConfirm("Login form layout is not recognized; missing: " + ", ".join(missing))
