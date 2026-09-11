@@ -25,6 +25,9 @@ post_submit = "[data-action='quick-post'], #quick-post, button[type='submit']"
 [browser]
 headless = true
 navigation_timeout_ms = 30000
+# Optional Playwright storage state exported by export_bahamut_session.py.
+# Use an absolute path on the Linux host and chmod 600 on this file.
+# storage_state = "/opt/bahamut-auto-bump/bahamut-session.json"
 # Optional: set this only when Chromium is installed outside Playwright.
 # executable_path = "/usr/bin/chromium"
 
