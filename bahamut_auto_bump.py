@@ -336,7 +336,7 @@ def run_once(config: Config) -> str:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except ImportError as exc:
-        raise CannotConfirm("Playwright is required; run pip install -r requirements.txt and playwright install chromium") from exc
+        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
     with sync_playwright() as playwright:
         engine = str(config.browser.get("engine", "chromium")).lower()
         storage_state = str(config.browser.get("storage_state", "")).strip()
@@ -377,17 +377,21 @@ def run_once(config: Config) -> str:
                         context.add_cookies(state.get("cookies", []))
                     except Exception as exc:
                         raise CannotConfirm(f"Could not import cookies into Obscura: {exc}") from exc
-            elif engine == "chromium":
+            elif engine in {"chrome", "chromium"}:
                 launch_options = {"headless": bool(config.browser.get("headless", True))}
                 if config.browser.get("executable_path"):
                     launch_options["executable_path"] = str(config.browser["executable_path"])
+                elif config.browser.get("channel"):
+                    launch_options["channel"] = str(config.browser["channel"])
+                elif engine == "chrome":
+                    launch_options["channel"] = "chrome"
                 browser = playwright.chromium.launch(**launch_options)
                 context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
                 if storage_state:
                     context_options["storage_state"] = storage_state
                 context = browser.new_context(**context_options)
             else:
-                raise ConfigError(f"Unsupported browser engine: {engine!r}; use 'obscura' or 'chromium'")
+                raise ConfigError(f"Unsupported browser engine: {engine!r}; use 'obscura', 'chrome', or 'chromium'")
             page = context.new_page()
             login(page, config)
             return inspect_and_maybe_bump(page, config, now)

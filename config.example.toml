@@ -37,6 +37,8 @@ navigation_timeout_ms = 30000
 # storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 # Optional: set this only when Chromium is installed outside Playwright.
 # executable_path = "/usr/bin/chromium"
+# For a system-installed Google Chrome use engine = "chrome" and:
+# channel = "chrome"
 
 [schedule]
 timezone = "Asia/Taipei"
