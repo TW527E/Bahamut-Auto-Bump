@@ -5,8 +5,8 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/opt/bahamut-auto-bump
-ExecStart=/opt/bahamut-auto-bump/.venv/bin/python /opt/bahamut-auto-bump/bahamut_auto_bump.py --config /opt/bahamut-auto-bump/config.toml
+WorkingDirectory=/opt/Bahamut-Auto-Bump
+ExecStart=/opt/Bahamut-Auto-Bump/.venv/bin/python /opt/Bahamut-Auto-Bump/bahamut_auto_bump.py --config /opt/Bahamut-Auto-Bump/config.toml
 Restart=always
 RestartSec=30
 User=bahamut-bump
@@ -14,7 +14,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/opt/bahamut-auto-bump
+ReadWritePaths=/opt/Bahamut-Auto-Bump
 
 [Install]
 WantedBy=multi-user.target
