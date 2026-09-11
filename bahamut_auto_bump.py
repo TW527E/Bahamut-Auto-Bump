@@ -378,10 +378,16 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     try:
         page.wait_for_load_state("domcontentloaded", timeout=int(config.browser.get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
-        LOG.warning("Reply navigation timed out; reloading for verification")
-    page.reload(wait_until="domcontentloaded")
-    _navigate_to_last_page(page, config)
-    verified = latest_post_timestamp(page, config, now)
+        LOG.warning("Reply navigation timed out; checking from an independent page")
+    verification_page = page.context.new_page()
+    try:
+        verification_page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+        verification_page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
+        verification_page.locator(selector).first.wait_for(state="attached")
+        _navigate_to_last_page(verification_page, config)
+        verified = latest_post_timestamp(verification_page, config, now)
+    finally:
+        verification_page.close()
     if not is_today(verified, now):
         raise CannotConfirm("Reply was submitted but the latest post could not be verified as today")
     LOG.info("Bump submitted and verified at %s", verified.isoformat())
