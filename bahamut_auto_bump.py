@@ -733,6 +733,16 @@ NOTIFICATION_TYPES = {"success", "error", "auth", "layout", "system"}
 class TelegramNotifier:
     """Small Bot API client; command state and update offset survive restarts."""
 
+    COMMANDS = [
+        {"command": "disable", "description": "關閉一種通知（可用按鈕選擇）"},
+        {"command": "enable", "description": "開啟一種通知（可用按鈕選擇）"},
+        {"command": "session", "description": "上傳並替換 Bahamut session"},
+        {"command": "test_cookie", "description": "測試 Cookie/session 是否有效"},
+        {"command": "set_message", "description": "設定頂文訊息"},
+        {"command": "status", "description": "查看通知與訊息設定"},
+        {"command": "help", "description": "查看所有指令"},
+    ]
+
     def __init__(self, config: Config):
         self.config = config
         self.token = str(config.telegram["bot_token"])
@@ -744,6 +754,13 @@ class TelegramNotifier:
         self.disabled = set(saved.get("disabled", [])) & NOTIFICATION_TYPES
         self.awaiting_session = bool(saved.get("awaiting_session", False))
         self.message_template = str(saved.get("message_template", ""))
+        self._register_commands()
+
+    def _register_commands(self) -> None:
+        try:
+            self._api("setMyCommands", {"commands": json.dumps(self.COMMANDS, ensure_ascii=False)})
+        except Exception as exc:
+            LOG.warning("Telegram command menu registration failed: %s", exc)
 
     def _read_state(self) -> dict[str, Any]:
         try:
@@ -793,6 +810,52 @@ class TelegramNotifier:
             self._api("sendMessage", {"chat_id": self.admin_chat_id, "text": text})
         except Exception as exc:
             LOG.warning("Telegram command reply failed: %s", exc)
+
+    def _notification_menu(self, action: str) -> None:
+        label = "關閉" if action == "disable" else "開啟"
+        buttons = [
+            [{"text": f"{label} {kind}", "callback_data": f"notify:{action}:{kind}"}]
+            for kind in sorted(NOTIFICATION_TYPES)
+        ]
+        buttons.append([{"text": f"{label}全部", "callback_data": f"notify:{action}:all"}])
+        try:
+            self._api(
+                "sendMessage",
+                {
+                    "chat_id": self.admin_chat_id,
+                    "text": f"請選擇要{label}的通知類型：",
+                    "reply_markup": json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+                },
+            )
+        except Exception as exc:
+            LOG.warning("Telegram notification menu failed: %s", exc)
+
+    def _handle_callback(self, callback: dict[str, Any]) -> None:
+        message = callback.get("message") or {}
+        chat = message.get("chat") or {}
+        callback_id = str(callback.get("id", ""))
+        if str(chat.get("id")) != self.admin_chat_id:
+            return
+        data = str(callback.get("data", ""))
+        parts = data.split(":")
+        if len(parts) != 3 or parts[0] != "notify" or parts[1] not in {"enable", "disable"}:
+            return
+        action, kind = parts[1], parts[2]
+        if kind not in NOTIFICATION_TYPES and kind != "all":
+            return
+        if action == "disable":
+            self.disabled = set(NOTIFICATION_TYPES) if kind == "all" else self.disabled | {kind}
+            reply = f"已關閉通知類型：{kind}。"
+        else:
+            self.disabled = set() if kind == "all" else self.disabled - {kind}
+            reply = f"已開啟通知類型：{kind}。"
+        self._write_state()
+        try:
+            if callback_id:
+                self._api("answerCallbackQuery", {"callback_query_id": callback_id, "text": reply})
+        except Exception as exc:
+            LOG.warning("Telegram callback acknowledgement failed: %s", exc)
+        self._command_reply(reply)
 
     def _replace_session(self, file_id: str) -> None:
         storage_state = str(self.config.browser.get("storage_state", "")).strip()
@@ -850,12 +913,19 @@ class TelegramNotifier:
 
     def poll_commands(self) -> None:
         try:
-            payload = self._api("getUpdates", {"offset": self.offset, "timeout": 0, "allowed_updates": '["message"]'})
+            payload = self._api(
+                "getUpdates",
+                {"offset": self.offset, "timeout": 0, "allowed_updates": '["message","callback_query"]'},
+            )
         except Exception as exc:
             LOG.warning("Telegram command polling failed: %s", exc)
             return
         for update in payload.get("result", []):
             self.offset = max(self.offset, int(update.get("update_id", 0)) + 1)
+            callback = update.get("callback_query")
+            if callback:
+                self._handle_callback(callback)
+                continue
             message = update.get("message") or {}
             chat = message.get("chat") or {}
             if str(chat.get("id")) != self.admin_chat_id:
@@ -878,10 +948,14 @@ class TelegramNotifier:
                 self.disabled = set(NOTIFICATION_TYPES) if arg == "all" else self.disabled | {arg}
                 self._write_state()
                 self._command_reply(f"已關閉通知類型：{arg}。使用 /enable {arg} 可重新開啟。")
+            elif name == "/disable":
+                self._notification_menu("disable")
             elif name == "/enable" and (arg in NOTIFICATION_TYPES or arg == "all"):
                 self.disabled = set() if arg == "all" else self.disabled - {arg}
                 self._write_state()
                 self._command_reply(f"已開啟通知類型：{arg}。")
+            elif name == "/enable":
+                self._notification_menu("enable")
             elif name == "/status":
                 enabled = sorted(NOTIFICATION_TYPES - self.disabled)
                 message_status = "自訂" if self.message_template else "設定檔預設"

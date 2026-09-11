@@ -104,7 +104,9 @@ journalctl -u bahamut-auto-bump.service -f
 
 ## Telegram 通知與指令
 
-成功頂文與錯誤通知都會發送到 `target_chat_id` 頻道；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景輪詢 `admin_chat_id` 管理者聊天中的指令，設定會保存到 `telegram_state.json`：
+成功頂文與錯誤通知都會發送到 `target_chat_id` 頻道；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景輪詢 `admin_chat_id` 管理者聊天中的指令，設定會保存到 `telegram_state.json`。
+
+Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。直接輸入 `/enable` 或 `/disable`（不帶參數）會顯示可點選的通知類型按鈕；也仍支援 `/enable success` 這種完整文字指令：
 
 ```text
 /disable success       關閉成功通知
