@@ -194,7 +194,10 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
             (posts, timeSelector) => posts.map((post) => {
               const visible = !!(post.offsetWidth || post.offsetHeight || post.getClientRects().length);
               const time = post.querySelector(timeSelector);
-              return { visible, raw: time?.getAttribute('datetime') || time?.textContent?.trim() || '' };
+              return {
+                visible,
+                raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || ''
+              };
             }).filter((item) => item.visible)
             """,
             time_selector,
