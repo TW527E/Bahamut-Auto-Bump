@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import sys
 import time
@@ -664,6 +665,44 @@ def run_cleanup(config: Config, max_deletions: int = 0) -> int:
                 browser.close()
 
 
+def test_imported_session(config: Config) -> None:
+    """Open Chrome with the imported storage state and verify authentication only."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if not storage_state or not Path(storage_state).exists():
+        raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
+    launch_options = {
+        "headless": bool(config.browser.get("headless", True)),
+        "channel": str(config.browser.get("channel", "chrome")),
+    }
+    if config.browser.get("executable_path"):
+        launch_options.pop("channel")
+        launch_options["executable_path"] = str(config.browser["executable_path"])
+    browser = None
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(**launch_options)
+            context = browser.new_context(
+                locale="zh-TW",
+                timezone_id=config.schedule["timezone"],
+                storage_state=storage_state,
+            )
+            page = context.new_page()
+            verify_imported_session(page, config)
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
+                raise CannotConfirm(
+                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
+                ) from exc
+            raise
+        finally:
+            if browser is not None:
+                browser.close()
+
+
 def state_path(config: Config) -> Path:
     return Path(str(config.schedule.get("state_file", "state.json")))
 
@@ -695,6 +734,7 @@ class TelegramNotifier:
     """Small Bot API client; command state and update offset survive restarts."""
 
     def __init__(self, config: Config):
+        self.config = config
         self.token = str(config.telegram["bot_token"])
         self.target_chat_id = str(config.telegram["target_chat_id"])
         self.admin_chat_id = str(config.telegram["admin_chat_id"])
@@ -702,6 +742,8 @@ class TelegramNotifier:
         saved = self._read_state()
         self.offset = int(saved.get("offset", 0))
         self.disabled = set(saved.get("disabled", [])) & NOTIFICATION_TYPES
+        self.awaiting_session = bool(saved.get("awaiting_session", False))
+        self.message_template = str(saved.get("message_template", ""))
 
     def _read_state(self) -> dict[str, Any]:
         try:
@@ -713,7 +755,18 @@ class TelegramNotifier:
     def _write_state(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(json.dumps({"offset": self.offset, "disabled": sorted(self.disabled)}), encoding="utf-8")
+        temporary.write_text(
+            json.dumps(
+                {
+                    "offset": self.offset,
+                    "disabled": sorted(self.disabled),
+                    "awaiting_session": self.awaiting_session,
+                    "message_template": self.message_template,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         temporary.replace(self.path)
 
     def _api(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -741,6 +794,60 @@ class TelegramNotifier:
         except Exception as exc:
             LOG.warning("Telegram command reply failed: %s", exc)
 
+    def _replace_session(self, file_id: str) -> None:
+        storage_state = str(self.config.browser.get("storage_state", "")).strip()
+        if not storage_state:
+            raise ConfigError("browser.storage_state is required for Telegram session upload")
+        file_info = self._api("getFile", {"file_id": file_id})
+        file_path = str((file_info.get("result") or {}).get("file_path", ""))
+        if not file_path:
+            raise RuntimeError("Telegram did not return a session file path")
+        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        with urllib.request.urlopen(url, timeout=30) as response:
+            raw = response.read(5 * 1024 * 1024 + 1)
+        if len(raw) > 5 * 1024 * 1024:
+            raise RuntimeError("Session file is too large")
+        try:
+            state = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("Uploaded file is not valid UTF-8 JSON") from exc
+        if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
+            raise RuntimeError("Uploaded file is not a Playwright storage_state JSON")
+        destination = Path(storage_state)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        temporary = destination.with_suffix(destination.suffix + ".telegram.tmp")
+        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
+        os.chmod(temporary, 0o600)
+        temporary.replace(destination)
+        self.awaiting_session = False
+        self._write_state()
+
+    def _set_message(self, value: str) -> None:
+        value = value.strip()
+        if value.lower() in {"default", "reset", "恢復預設"}:
+            self.message_template = ""
+        else:
+            if not value:
+                raise ValueError("訊息不可為空")
+            if len(value) > 1000:
+                raise ValueError("訊息長度不可超過 1000 個字元")
+            try:
+                value.format(timestamp="2026-01-01 00:00:00 UTC+8")
+            except (KeyError, ValueError, IndexError) as exc:
+                raise ValueError("訊息模板格式錯誤，只能使用 {timestamp} 變數") from exc
+            self.message_template = value
+        self._write_state()
+
+    def configured(self, config: Config) -> Config:
+        """Return config with a Telegram-managed message override, if present."""
+        if not self.message_template:
+            return config
+        thread = dict(config.thread)
+        thread["content_template"] = self.message_template
+        values = dict(config.values)
+        values["thread"] = thread
+        return Config(values)
+
     def poll_commands(self) -> None:
         try:
             payload = self._api("getUpdates", {"offset": self.offset, "timeout": 0, "allowed_updates": '["message"]'})
@@ -753,11 +860,20 @@ class TelegramNotifier:
             chat = message.get("chat") or {}
             if str(chat.get("id")) != self.admin_chat_id:
                 continue
-            command = str(message.get("text", "")).strip().split()
-            if not command:
+            text = str(message.get("text") or message.get("caption") or "").strip()
+            command = text.split(maxsplit=1)
+            name = command[0].split("@", 1)[0].lower() if command else ""
+            arg_text = command[1] if len(command) > 1 else ""
+            arg = arg_text.lower()
+            document = message.get("document") or {}
+            if document and (self.awaiting_session or name in {"/session", "/upload_session", "/replace_session"}):
+                try:
+                    self._replace_session(str(document.get("file_id", "")))
+                    self._command_reply("新的 Bahamut session 已驗證格式並替換完成。使用 /test_cookie 測試登入狀態。")
+                except Exception as exc:
+                    LOG.warning("Telegram session replacement failed: %s", exc)
+                    self._command_reply(f"session 替換失敗：{exc}")
                 continue
-            name = command[0].split("@", 1)[0].lower()
-            arg = command[1].lower() if len(command) > 1 else ""
             if name == "/disable" and (arg in NOTIFICATION_TYPES or arg == "all"):
                 self.disabled = set(NOTIFICATION_TYPES) if arg == "all" else self.disabled | {arg}
                 self._write_state()
@@ -768,9 +884,30 @@ class TelegramNotifier:
                 self._command_reply(f"已開啟通知類型：{arg}。")
             elif name == "/status":
                 enabled = sorted(NOTIFICATION_TYPES - self.disabled)
-                self._command_reply("啟用通知：" + (", ".join(enabled) if enabled else "無"))
+                message_status = "自訂" if self.message_template else "設定檔預設"
+                self._command_reply("啟用通知：" + (", ".join(enabled) if enabled else "無") + f"\n頂文訊息：{message_status}")
+            elif name in {"/session", "/upload_session", "/replace_session"}:
+                self.awaiting_session = True
+                self._write_state()
+                self._command_reply("請直接上傳新的 bahamut-session.json 文件；收到後會原子替換目前 session。")
+            elif name in {"/test_cookie", "/test_session"}:
+                try:
+                    test_imported_session(self.config)
+                    self._command_reply("Cookie/session 測試成功，巴哈姆特目前仍是登入狀態。")
+                except Exception as exc:
+                    self._command_reply(f"Cookie/session 測試失敗：{exc}")
+            elif name in {"/set_message", "/set_bump_message"}:
+                try:
+                    self._set_message(arg_text)
+                    shown = self.message_template or "設定檔預設訊息"
+                    self._command_reply(f"頂文訊息已更新為：\n{shown}")
+                except Exception as exc:
+                    self._command_reply(f"頂文訊息更新失敗：{exc}")
             elif name in {"/help", "/start"}:
-                self._command_reply("指令：/disable <success|error|auth|layout|system|all>、/enable <類型|all>、/status、/help")
+                self._command_reply(
+                    "指令：/disable <success|error|auth|layout|system|all>、/enable <類型|all>、"
+                    "/session 後上傳 session JSON、/test_cookie、/set_message <訊息>、/status、/help"
+                )
         self._write_state()
 
 
@@ -814,7 +951,7 @@ def run_loop(config: Config) -> None:
             sleep_with_telegram(min(max(30, int((due - now).total_seconds())), 3600), notifier)
             continue
         try:
-            result = run_once(config)
+            result = run_once(notifier.configured(config))
             write_state(path, now.date())
             if result == "posted":
                 notifier.send("success", f"巴哈姆特頂文成功\n文章：{config.thread['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
@@ -845,7 +982,7 @@ def main() -> int:
             return 0
         notifier = TelegramNotifier(config)
         if args.once:
-            result = run_once(config)
+            result = run_once(notifier.configured(config))
             if result == "posted":
                 notifier.send("success", f"巴哈姆特頂文成功\n文章：{config.thread['url']}")
         else:
