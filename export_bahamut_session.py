@@ -11,9 +11,16 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="https://user.gamer.com.tw/login.php")
     parser.add_argument("--output", type=Path, default=Path("bahamut-session.json"))
+    parser.add_argument("--channel", default="chrome", help="installed browser channel; defaults to Google Chrome Stable")
+    parser.add_argument("--executable-path", help="explicit path to an installed Chrome executable")
     args = parser.parse_args()
     with sync_playwright() as playwright:
-        browser = playwright.chromium.launch(headless=False)
+        launch_options = {"headless": False}
+        if args.executable_path:
+            launch_options["executable_path"] = args.executable_path
+        else:
+            launch_options["channel"] = args.channel
+        browser = playwright.chromium.launch(**launch_options)
         context = browser.new_context(locale="zh-TW", timezone_id="Asia/Taipei")
         page = context.new_page()
         page.goto(args.url, wait_until="domcontentloaded")
