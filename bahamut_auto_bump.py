@@ -8,6 +8,8 @@ import binascii
 import json
 import logging
 import re
+import socket
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -319,23 +321,85 @@ def run_once(config: Config) -> str:
     except ImportError as exc:
         raise CannotConfirm("Playwright is required; run pip install -r requirements.txt and playwright install chromium") from exc
     with sync_playwright() as playwright:
-        launch_options = {"headless": bool(config.browser.get("headless", True))}
-        if config.browser.get("executable_path"):
-            launch_options["executable_path"] = str(config.browser["executable_path"])
+        engine = str(config.browser.get("engine", "chromium")).lower()
         storage_state = str(config.browser.get("storage_state", "")).strip()
         if storage_state and not Path(storage_state).exists():
             raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
-        browser = playwright.chromium.launch(**launch_options)
+        browser = None
+        obscura_process = None
+        started_obscura = False
         try:
-            context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
-            if storage_state:
-                context_options["storage_state"] = storage_state
-            context = browser.new_context(**context_options)
+            if engine == "obscura":
+                binary = str(config.browser.get("obscura_binary", "obscura"))
+                port = int(config.browser.get("obscura_port", 9222))
+                if not _tcp_port_open("127.0.0.1", port):
+                    command = [binary, "serve", "--port", str(port)]
+                    if bool(config.browser.get("obscura_stealth", False)):
+                        command.append("--stealth")
+                    storage_dir = str(config.browser.get("obscura_storage_dir", "")).strip()
+                    if storage_dir:
+                        command.extend(["--storage-dir", storage_dir])
+                    try:
+                        obscura_process = subprocess.Popen(
+                            command, stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT, start_new_session=True
+                        )
+                    except OSError as exc:
+                        raise CannotConfirm(f"Could not start Obscura ({binary!r}): {exc}") from exc
+                    started_obscura = True
+                    if not _wait_for_tcp_port("127.0.0.1", port, int(config.browser.get("obscura_start_timeout_seconds", 20))):
+                        raise CannotConfirm(f"Obscura did not listen on 127.0.0.1:{port}")
+                try:
+                    browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{port}")
+                except Exception as exc:
+                    raise CannotConfirm(f"Could not connect to Obscura CDP on port {port}: {exc}") from exc
+                contexts = browser.contexts
+                context = contexts[0] if contexts else browser.new_context()
+                if storage_state:
+                    try:
+                        state = json.loads(Path(storage_state).read_text(encoding="utf-8"))
+                        context.add_cookies(state.get("cookies", []))
+                    except Exception as exc:
+                        raise CannotConfirm(f"Could not import cookies into Obscura: {exc}") from exc
+            elif engine == "chromium":
+                launch_options = {"headless": bool(config.browser.get("headless", True))}
+                if config.browser.get("executable_path"):
+                    launch_options["executable_path"] = str(config.browser["executable_path"])
+                browser = playwright.chromium.launch(**launch_options)
+                context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
+                if storage_state:
+                    context_options["storage_state"] = storage_state
+                context = browser.new_context(**context_options)
+            else:
+                raise ConfigError(f"Unsupported browser engine: {engine!r}; use 'obscura' or 'chromium'")
             page = context.new_page()
             login(page, config)
             return inspect_and_maybe_bump(page, config, now)
         finally:
-            browser.close()
+            if browser is not None:
+                browser.close()
+            if started_obscura and obscura_process is not None:
+                obscura_process.terminate()
+                try:
+                    obscura_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    obscura_process.kill()
+
+
+def _tcp_port_open(host: str, port: int) -> bool:
+    try:
+        with socket.create_connection((host, port), timeout=0.5):
+            return True
+    except OSError:
+        return False
+
+
+def _wait_for_tcp_port(host: str, port: int, timeout_seconds: int) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if _tcp_port_open(host, port):
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def state_path(config: Config) -> Path:

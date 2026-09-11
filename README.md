@@ -29,7 +29,8 @@ storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 python3 -m venv .venv
 . .venv/bin/activate
 pip install -r requirements.txt
-playwright install --with-deps chromium
+# Only needed when [browser] engine = "chromium".
+# playwright install --with-deps chromium
 cp config.example.toml config.toml
 chmod 600 config.toml
 ```
@@ -40,6 +41,15 @@ chmod 600 config.toml
 . .venv/bin/activate
 python bahamut_auto_bump.py --config config.toml --once
 ```
+
+## Obscura backend
+
+Set `[browser] engine = "obscura"`. Install an Obscura Linux release binary and
+set `obscura_binary` if it is not on `PATH`; the worker starts `obscura serve`
+and connects over local CDP, so no display server or Chromium is required.
+`obscura_stealth` is off by default. Obscura's own documentation says stealth
+does not solve Cloudflare interactive challenges or CAPTCHAs; this project will
+still stop and retry rather than bypass them.
 
 ## systemd 常駐服務
 
