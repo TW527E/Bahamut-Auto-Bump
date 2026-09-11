@@ -331,7 +331,24 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         raise CannotConfirm("Reply editor layout is not recognized")
     editor_tag = editor.evaluate("element => element.tagName")
     if editor_tag == "IFRAME":
-        page.frame_locator(editor_selector).locator("body").fill(body)
+        page.evaluate(
+            """
+            ({editorSelector, value}) => {
+              const iframe = document.querySelector(editorSelector);
+              const doc = iframe && iframe.contentDocument;
+              const edit = doc && (doc.getElementsByClassName('editstyle')[0] || doc.body);
+              if (!edit) throw new Error('Bahamut iframe editor is not ready');
+              edit.replaceChildren();
+              value.split('\\n').forEach((line, index) => {
+                if (index) edit.appendChild(doc.createElement('br'));
+                edit.appendChild(doc.createTextNode(line));
+              });
+              edit.dispatchEvent(new Event('input', {bubbles: true}));
+              edit.dispatchEvent(new Event('change', {bubbles: true}));
+            }
+            """,
+            {"editorSelector": editor_selector, "value": body},
+        )
         # The quick-reply controls are injected only after authentication. When
         # their markup changes, submit the same form used by Bahamut's quickPost.
         page.evaluate(
@@ -339,7 +356,7 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
             (editorSelector) => {
               const iframe = document.querySelector(editorSelector);
               const doc = iframe && iframe.contentDocument;
-              const edit = doc && doc.getElementsByClassName('editstyle')[0];
+              const edit = doc && (doc.getElementsByClassName('editstyle')[0] || doc.body);
               const form = document.forms.frm;
               const target = form && form.elements.rtecontent;
               if (!edit || !form || !target) throw new Error('Bahamut editor form is not ready');
