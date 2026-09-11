@@ -103,9 +103,20 @@ def taiwan_now(config: Config) -> datetime:
     return datetime.now(ZoneInfo(config.schedule["timezone"]))
 
 
-def parse_post_time(raw: str, timezone: ZoneInfo) -> datetime:
+def parse_post_time(raw: str, timezone: ZoneInfo, reference: datetime | None = None) -> datetime:
     """Parse ISO/HTML datetime or common Bahamut textual timestamps."""
     value = raw.strip()
+    relative = re.search(r"(今天|昨天|前天)\s+(\d{1,2}):(\d{2})(?::(\d{2}))?", value)
+    if relative:
+        offsets = {"今天": 0, "昨天": 1, "前天": 2}
+        base = (reference or datetime.now(timezone)).astimezone(timezone)
+        hour = int(relative.group(2))
+        minute = int(relative.group(3))
+        second = int(relative.group(4) or 0)
+        if hour > 23 or minute > 59 or second > 59:
+            raise CannotConfirm(f"Invalid relative post timestamp: {raw!r}")
+        post_date = base.date() - timedelta(days=offsets[relative.group(1)])
+        return datetime.combine(post_date, dt_time(hour, minute, second), tzinfo=timezone)
     textual = re.search(r"\d{4}(?:[-/]\d{2}[-/]\d{2}|年\d{2}月\d{2}日)\s+\d{2}:\d{2}(?::\d{2})?", value)
     if textual:
         value = textual.group(0)
@@ -194,7 +205,7 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
         raise CannotConfirm("No visible post containers matched post_selector")
     if any(not item["raw"] for item in result):
         raise CannotConfirm("At least one visible post has no readable timestamp")
-    return parse_post_time(result[-1]["raw"], now.tzinfo)
+    return parse_post_time(result[-1]["raw"], now.tzinfo, now)
 
 
 def _first_visible(page: Any, selectors: str):

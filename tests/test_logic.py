@@ -17,6 +17,16 @@ class TimestampTests(unittest.TestCase):
         value = parse_post_time("2026/09/12 08:30", self.tz)
         self.assertEqual(value, datetime(2026, 9, 12, 8, 30, tzinfo=self.tz))
 
+    def test_relative_yesterday_timestamp_uses_reference_date(self):
+        now = datetime(2026, 9, 12, 4, 9, tzinfo=self.tz)
+        value = parse_post_time("昨天 06:31", self.tz, now)
+        self.assertEqual(value, datetime(2026, 9, 11, 6, 31, tzinfo=self.tz))
+
+    def test_relative_today_timestamp_with_edit_suffix(self):
+        now = datetime(2026, 9, 12, 12, 0, tzinfo=self.tz)
+        value = parse_post_time("今天 11:59 編輯", self.tz, now)
+        self.assertEqual(value, datetime(2026, 9, 12, 11, 59, tzinfo=self.tz))
+
     def test_bad_timestamp_is_rejected(self):
         with self.assertRaises(Exception):
             parse_post_time("not-a-time", self.tz)
