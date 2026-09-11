@@ -1,0 +1,44 @@
+[account]
+username = "your-bahamut-account"
+password = "your-bahamut-password"
+# Base32 TOTP secret from the account's two-factor setup (spaces are accepted).
+totp_secret = "JBSWY3DPEHPK3PXP"
+
+[thread]
+url = "https://forum.gamer.com.tw/C.php?bsn=00000&snA=000000"
+content_template = "頂🆙！\n（{timestamp}）"
+
+[selectors]
+# Keep these configurable because Bahamut may change its markup.
+login_url = "https://user.gamer.com.tw/login.php"
+username = "input[name='userid'], input[name='account'], input[type='email']"
+password = "input[name='password'], input[type='password']"
+totp = "input[name='otp'], input[name='code'], input[autocomplete='one-time-code']"
+login_submit = "button[type='submit'], input[type='submit']"
+totp_submit = "button[type='submit'], input[type='submit']"
+logout = "a[href*='logout'], [data-action='logout']"
+post_selector = "article.c-post, [data-post-id], .c-post"
+post_time_selector = "time[datetime], .edittime, .c-post__header time"
+editor = "textarea[name='content'], textarea"
+post_submit = "button[type='submit'], input[type='submit']"
+
+[browser]
+headless = true
+navigation_timeout_ms = 30000
+# Optional: set this only when Chromium is installed outside Playwright.
+# executable_path = "/usr/bin/chromium"
+
+[schedule]
+timezone = "Asia/Taipei"
+time = "09:00"
+retry_interval_seconds = 900
+state_file = "state.json"
+
+[telegram]
+# Create a bot with @BotFather. Add it as an administrator of the target
+# channel so it can publish messages. Channel ids usually look like -100....
+bot_token = "123456789:replace-with-your-bot-token"
+target_chat_id = "-1001234567890"
+# Only this administrator's chat may change notification settings by command.
+admin_chat_id = "123456789"
+state_file = "telegram_state.json"
