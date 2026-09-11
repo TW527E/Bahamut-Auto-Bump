@@ -283,14 +283,19 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
         try:
             posts_locator = page.locator(selector)
             if posts_locator.count() == 0:
-                # Deleting replies can shrink the final page while an older
-                # pagination link is still present. Since pages are scanned in
-                # ascending order, an empty page after collected posts is a
-                # stale trailing page; an empty first page remains an error.
-                if result:
-                    LOG.info("Reached an empty trailing page after cleanup; stopping at the new last page")
-                    break
-                raise CannotConfirm(f"Thread page has no post containers: {page_url}")
+                # After mass deletion Bahamut can retain sparse page numbers:
+                # page 2 may be empty while pages 14 and 16 still contain old
+                # replies. Skip a confirmed empty thread page and keep scanning.
+                title = page.title()
+                if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
+                    raise CannotConfirm(
+                        f"Bahamut anti-bot challenge blocked cleanup; url={page.url!r}, title={title!r}"
+                    )
+                if page.locator("#BH-master").count() == 0:
+                    raise CannotConfirm(f"Thread page layout is missing at {page_url}; title={title!r}")
+                page_number = urllib.parse.parse_qs(urllib.parse.urlparse(page_url).query).get("page", ["?"])[0]
+                LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
+                continue
             posts_locator.first.wait_for(state="attached", timeout=timeout)
             rows = page.locator("section[id^='post_']").evaluate_all(
                 """
