@@ -1,22 +1,9 @@
-[account]
-username = "your-bahamut-account"
-password = "your-bahamut-password"
-# Base32 TOTP secret from the account's two-factor setup (spaces are accepted).
-totp_secret = "JBSWY3DPEHPK3PXP"
-
 [thread]
 url = "https://forum.gamer.com.tw/C.php?bsn=00000&snA=000000"
 content_template = "頂🆙！\n（{timestamp}）"
 
 [selectors]
 # Keep these configurable because Bahamut may change its markup.
-login_url = "https://user.gamer.com.tw/login.php"
-username = "#form-login input[name='userid']"
-password = "#form-login input[name='password']"
-totp = "#input-2sa, input[name='twoStepAuth']"
-login_submit = "#btn-login"
-totp_submit = "#btn-login, button[type='submit'], input[type='submit']"
-logout = "a[href*='logout'], [data-action='logout']"
 post_selector = "#BH-master > section[id^='post_'] .c-post"
 post_time_selector = ".edittime"
 editor = "#editor"
@@ -28,9 +15,9 @@ navigation_timeout_ms = 30000
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"
-# Optional Playwright storage state exported by export_bahamut_session.py.
-# Use an absolute path on the Linux host and chmod 600 on this file.
-# storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
+# Required authenticated Playwright storage state. The main script never asks
+# for or enters any Bahamut account credentials.
+storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 # Optional explicit path instead of channel detection:
 # executable_path = "/usr/bin/google-chrome-stable"
 
