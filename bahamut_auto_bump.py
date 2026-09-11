@@ -277,7 +277,9 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
                 """
                 (sections, timeSelector) => sections.map((section) => {
                   const floorLink = Array.from(section.querySelectorAll('a')).find(a => /\\d+\\s*樓/.test((a.textContent || '').trim()));
-                  const menu = section.querySelector('button.tippy-option-menu,[data-tippy]');
+                  // The section also contains data-tippy attributes for GP/BP
+                  // counters; only the option-menu metadata includes owner.
+                  const menu = section.querySelector('button.tippy-option-menu') || section.querySelector('[data-tippy]');
                   let meta = {};
                   try { meta = JSON.parse(menu?.getAttribute('data-tippy') || '{}'); } catch (_) {}
                   const time = section.querySelector(timeSelector) || section.querySelector('time[datetime], .edittime');
