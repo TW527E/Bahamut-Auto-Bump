@@ -259,13 +259,30 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config.selectors.get("post_time_selector", ".edittime"))
-    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
     try:
+        configured = urllib.parse.urlparse(str(config.thread["url"]))
+        current = urllib.parse.urlparse(str(page.url))
+        configured_query = urllib.parse.parse_qs(configured.query)
+        current_query = urllib.parse.parse_qs(current.query)
+        same_thread = (
+            current.path == configured.path
+            and current_query.get("bsn") == configured_query.get("bsn")
+            and current_query.get("snA") == configured_query.get("snA")
+        )
+        if not same_thread or page.locator(selector).count() == 0:
+            page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
         page.locator(selector).first.wait_for(state="attached", timeout=timeout)
         page_urls = _thread_page_urls(page, config)
     except Exception as exc:
-        raise CannotConfirm(f"Could not inspect thread pages: {exc}") from exc
+        try:
+            title = page.title()
+            url = page.url
+        except Exception:
+            title, url = "<unavailable>", "<unavailable>"
+        raise CannotConfirm(
+            f"Could not inspect thread pages; url={url!r}, title={title!r}: {exc}"
+        ) from exc
 
     result: list[PostInfo] = []
     for page_url in page_urls:
