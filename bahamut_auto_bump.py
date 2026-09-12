@@ -746,6 +746,14 @@ def scheduled_datetime(now: datetime, config: Config) -> datetime:
 
 
 NOTIFICATION_TYPES = {"success", "error", "auth", "layout", "system"}
+NOTIFICATION_LABELS = {
+    "success": "成功通知",
+    "error": "錯誤通知",
+    "auth": "Cookie/session 通知",
+    "layout": "排版通知",
+    "system": "系統通知",
+}
+NOTIFICATION_ORDER = ("success", "error", "auth", "layout", "system")
 
 
 class TelegramNotifier:
@@ -776,7 +784,13 @@ class TelegramNotifier:
 
     def _register_commands(self) -> None:
         try:
-            self._api("setMyCommands", {"commands": json.dumps(self.COMMANDS, ensure_ascii=False)})
+            self._api(
+                "setMyCommands",
+                {
+                    "commands": json.dumps(self.COMMANDS, ensure_ascii=False),
+                    "scope": json.dumps({"type": "chat", "chat_id": self.admin_chat_id}),
+                },
+            )
         except Exception as exc:
             LOG.warning("Telegram command menu registration failed: %s", exc)
 
@@ -831,11 +845,7 @@ class TelegramNotifier:
 
     def _notification_menu(self, action: str) -> None:
         label = "關閉" if action == "disable" else "開啟"
-        buttons = [
-            [{"text": f"{label} {kind}", "callback_data": f"notify:{action}:{kind}"}]
-            for kind in sorted(NOTIFICATION_TYPES)
-        ]
-        buttons.append([{"text": f"{label}全部", "callback_data": f"notify:{action}:all"}])
+        buttons = self._notification_buttons(action)
         try:
             self._api(
                 "sendMessage",
@@ -847,6 +857,32 @@ class TelegramNotifier:
             )
         except Exception as exc:
             LOG.warning("Telegram notification menu failed: %s", exc)
+
+    def _notification_buttons(self, action: str) -> list[list[dict[str, str]]]:
+        """Build Chinese labels with current state shown by emoji."""
+        buttons = []
+        for kind in NOTIFICATION_ORDER:
+            status = "✅" if kind not in self.disabled else "❌"
+            buttons.append([{"text": f"{status} {NOTIFICATION_LABELS[kind]}", "callback_data": f"notify:{action}:{kind}"}])
+        buttons.append([{
+            "text": f"{'✅' if not self.disabled else '❌'} 全部通知",
+            "callback_data": f"notify:{action}:all",
+        }])
+        return buttons
+
+    def _refresh_notification_menu(self, message: dict[str, Any], action: str) -> None:
+        message_id = message.get("message_id")
+        if not message_id:
+            return
+        chat = message.get("chat") or {}
+        try:
+            self._api("editMessageReplyMarkup", {
+                "chat_id": str(chat.get("id", self.admin_chat_id)),
+                "message_id": str(message_id),
+                "reply_markup": json.dumps({"inline_keyboard": self._notification_buttons(action)}, ensure_ascii=False),
+            })
+        except Exception as exc:
+            LOG.warning("Telegram notification menu refresh failed: %s", exc)
 
     def _handle_callback(self, callback: dict[str, Any]) -> None:
         message = callback.get("message") or {}
@@ -863,11 +899,12 @@ class TelegramNotifier:
             return
         if action == "disable":
             self.disabled = set(NOTIFICATION_TYPES) if kind == "all" else self.disabled | {kind}
-            reply = f"已關閉通知類型：{kind}。"
+            reply = f"已關閉通知類型：{NOTIFICATION_LABELS.get(kind, '全部通知') if kind != 'all' else '全部通知'}。"
         else:
             self.disabled = set() if kind == "all" else self.disabled - {kind}
-            reply = f"已開啟通知類型：{kind}。"
+            reply = f"已開啟通知類型：{NOTIFICATION_LABELS.get(kind, '全部通知') if kind != 'all' else '全部通知'}。"
         self._write_state()
+        self._refresh_notification_menu(message, action)
         try:
             if callback_id:
                 self._api("answerCallbackQuery", {"callback_query_id": callback_id, "text": reply})
@@ -977,7 +1014,7 @@ class TelegramNotifier:
             elif name == "/status":
                 enabled = sorted(NOTIFICATION_TYPES - self.disabled)
                 message_status = "自訂" if self.message_template else "設定檔預設"
-                self._command_reply("啟用通知：" + (", ".join(enabled) if enabled else "無") + f"\n頂文訊息：{message_status}")
+                self._command_reply("啟用通知：" + (", ".join(NOTIFICATION_LABELS[kind] for kind in NOTIFICATION_ORDER if kind in enabled) if enabled else "無") + f"\n頂文訊息：{message_status}")
             elif name in {"/session", "/upload_session", "/replace_session"}:
                 self.awaiting_session = True
                 self._write_state()
