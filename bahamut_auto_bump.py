@@ -760,8 +760,7 @@ class TelegramNotifier:
     """Small Bot API client; command state and update offset survive restarts."""
 
     COMMANDS = [
-        {"command": "disable", "description": "關閉一種通知（可用按鈕選擇）"},
-        {"command": "enable", "description": "開啟一種通知（可用按鈕選擇）"},
+        {"command": "toggle", "description": "切換通知狀態（可用按鈕選擇）"},
         {"command": "session", "description": "上傳並替換 Bahamut session"},
         {"command": "test_cookie", "description": "測試 Cookie/session 是否有效"},
         {"command": "set_message", "description": "設定頂文訊息"},
@@ -832,6 +831,9 @@ class TelegramNotifier:
         if kind in self.disabled:
             LOG.info("Telegram notification type %s is disabled", kind)
             return
+        prefix = "✅" if kind == "success" else "❌" if kind in {"error", "auth", "layout", "system"} else ""
+        if prefix and not text.startswith(prefix):
+            text = f"{prefix} {text}"
         try:
             self._api("sendMessage", {"chat_id": self.target_chat_id, "text": text})
         except Exception as exc:
@@ -844,7 +846,7 @@ class TelegramNotifier:
             LOG.warning("Telegram command reply failed: %s", exc)
 
     def _notification_menu(self, action: str) -> None:
-        label = "關閉" if action == "disable" else "開啟"
+        label = {"disable": "關閉", "enable": "開啟", "toggle": "切換"}.get(action, "切換")
         buttons = self._notification_buttons(action)
         try:
             self._api(
@@ -892,12 +894,22 @@ class TelegramNotifier:
             return
         data = str(callback.get("data", ""))
         parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "notify" or parts[1] not in {"enable", "disable"}:
+        if len(parts) != 3 or parts[0] != "notify" or parts[1] not in {"toggle", "enable", "disable"}:
             return
         action, kind = parts[1], parts[2]
         if kind not in NOTIFICATION_TYPES and kind != "all":
             return
-        if action == "disable":
+        if action == "toggle":
+            if kind == "all":
+                self.disabled = set() if self.disabled else set(NOTIFICATION_TYPES)
+                reply = "已切換全部通知。"
+            elif kind in self.disabled:
+                self.disabled.remove(kind)
+                reply = f"已開啟通知類型：{NOTIFICATION_LABELS[kind]}。"
+            else:
+                self.disabled.add(kind)
+                reply = f"已關閉通知類型：{NOTIFICATION_LABELS[kind]}。"
+        elif action == "disable":
             self.disabled = set(NOTIFICATION_TYPES) if kind == "all" else self.disabled | {kind}
             reply = f"已關閉通知類型：{NOTIFICATION_LABELS.get(kind, '全部通知') if kind != 'all' else '全部通知'}。"
         else:
@@ -999,18 +1011,20 @@ class TelegramNotifier:
                     LOG.warning("Telegram session replacement failed: %s", exc)
                     self._command_reply(f"session 替換失敗：{exc}")
                 continue
-            if name == "/disable" and (arg in NOTIFICATION_TYPES or arg == "all"):
-                self.disabled = set(NOTIFICATION_TYPES) if arg == "all" else self.disabled | {arg}
+            if name == "/toggle" and (arg in NOTIFICATION_TYPES or arg == "all"):
+                if arg == "all":
+                    self.disabled = set() if self.disabled else set(NOTIFICATION_TYPES)
+                    reply = "已切換全部通知。"
+                elif arg in self.disabled:
+                    self.disabled.remove(arg)
+                    reply = f"已開啟通知類型：{NOTIFICATION_LABELS[arg]}。"
+                else:
+                    self.disabled.add(arg)
+                    reply = f"已關閉通知類型：{NOTIFICATION_LABELS[arg]}。"
                 self._write_state()
-                self._command_reply(f"已關閉通知類型：{arg}。使用 /enable {arg} 可重新開啟。")
-            elif name == "/disable":
-                self._notification_menu("disable")
-            elif name == "/enable" and (arg in NOTIFICATION_TYPES or arg == "all"):
-                self.disabled = set() if arg == "all" else self.disabled - {arg}
-                self._write_state()
-                self._command_reply(f"已開啟通知類型：{arg}。")
-            elif name == "/enable":
-                self._notification_menu("enable")
+                self._command_reply(reply)
+            elif name == "/toggle":
+                self._notification_menu("toggle")
             elif name == "/status":
                 enabled = sorted(NOTIFICATION_TYPES - self.disabled)
                 message_status = "自訂" if self.message_template else "設定檔預設"
@@ -1034,7 +1048,7 @@ class TelegramNotifier:
                     self._command_reply(f"頂文訊息更新失敗：{exc}")
             elif name in {"/help", "/start"}:
                 self._command_reply(
-                    "指令：/disable <success|error|auth|layout|system|all>、/enable <類型|all>、"
+                    "指令：/toggle <success|error|auth|layout|system|all>、"
                     "/session 後上傳 session JSON、/test_cookie、/set_message <訊息>、/status、/help"
                 )
         self._write_state()
