@@ -65,10 +65,16 @@ class CleanupTests(unittest.TestCase):
 
 
 class NotificationMenuTests(unittest.TestCase):
+    def test_command_menu_uses_toggle_only(self):
+        commands = {item["command"] for item in TelegramNotifier.COMMANDS}
+        self.assertIn("toggle", commands)
+        self.assertNotIn("enable", commands)
+        self.assertNotIn("disable", commands)
+
     def test_buttons_show_chinese_labels_and_current_emoji_state(self):
         notifier = TelegramNotifier.__new__(TelegramNotifier)
         notifier.disabled = {"error", "system"}
-        buttons = notifier._notification_buttons("disable")
+        buttons = notifier._notification_buttons("toggle")
         labels = [row[0]["text"] for row in buttons]
         self.assertEqual(labels[:5], [
             f"✅ {NOTIFICATION_LABELS['success']}",
@@ -79,6 +85,17 @@ class NotificationMenuTests(unittest.TestCase):
         ])
         self.assertEqual(labels[5], "❌ 全部通知")
         self.assertEqual(tuple(NOTIFICATION_LABELS), NOTIFICATION_ORDER)
+
+    def test_send_prefixes_success_and_error_notifications(self):
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.disabled = set()
+        notifier.target_chat_id = "chat"
+        sent = []
+        notifier._api = lambda method, params: sent.append(params)
+        notifier.send("success", "頂文成功")
+        notifier.send("auth", "Cookie 已失效")
+        self.assertEqual(sent[0]["text"], "✅ 頂文成功")
+        self.assertEqual(sent[1]["text"], "❌ Cookie 已失效")
 
 
 if __name__ == "__main__":

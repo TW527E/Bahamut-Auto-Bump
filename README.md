@@ -106,16 +106,10 @@ journalctl -u bahamut-auto-bump.service -f
 
 成功頂文與錯誤通知都會發送到 `target_chat_id` 頻道；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景輪詢 `admin_chat_id` 管理者聊天中的指令，設定會保存到 `telegram_state.json`。
 
-Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。直接輸入 `/enable` 或 `/disable`（不帶參數）會顯示中文通知選單；每個按鈕以 `✅` 表示開啟、`❌` 表示關閉，不使用括弧顯示狀態。點擊後按鈕會立即刷新為最新狀態，也仍支援 `/enable success` 這種完整文字指令：
+Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。輸入 `/toggle` 會顯示中文通知選單；每個按鈕以 `✅` 表示開啟、`❌` 表示關閉，不使用括弧顯示狀態。點擊後按鈕會立即切換並刷新為最新狀態，也支援 `/toggle success` 直接切換指定類型：
 
 ```text
-/disable success       關閉成功通知
-/disable error         關閉一般錯誤通知
-/disable auth          關閉 Cookie/session 通知
-/disable layout        關閉排版/時間解析通知
-/disable system        關閉未預期錯誤通知
-/disable all           關閉所有通知
-/enable <類型|all>     重新開啟通知
+/toggle <類型|all>     切換通知開關狀態
 /session               等待下一則上傳的 session JSON 並替換目前檔案
 /test_cookie           立即測試匯入的 Cookie/session 是否仍有效
 /set_message <訊息>    設定頂文訊息，可使用 {timestamp}
