@@ -2,7 +2,14 @@ import unittest
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
-from bahamut_auto_bump import PostInfo, deletion_candidates, parse_post_time
+from bahamut_auto_bump import (
+    NOTIFICATION_LABELS,
+    NOTIFICATION_ORDER,
+    PostInfo,
+    TelegramNotifier,
+    deletion_candidates,
+    parse_post_time,
+)
 
 
 class TimestampTests(unittest.TestCase):
@@ -55,6 +62,23 @@ class CleanupTests(unittest.TestCase):
             PostInfo(2, "1500", True, "2026-01-04 00:00:00", "newest reply"),
         ]
         self.assertEqual([post.sn for post in deletion_candidates(posts, 1)], ["1400", "800"])
+
+
+class NotificationMenuTests(unittest.TestCase):
+    def test_buttons_show_chinese_labels_and_current_emoji_state(self):
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.disabled = {"error", "system"}
+        buttons = notifier._notification_buttons("disable")
+        labels = [row[0]["text"] for row in buttons]
+        self.assertEqual(labels[:5], [
+            f"✅ {NOTIFICATION_LABELS['success']}",
+            f"❌ {NOTIFICATION_LABELS['error']}",
+            f"✅ {NOTIFICATION_LABELS['auth']}",
+            f"✅ {NOTIFICATION_LABELS['layout']}",
+            f"❌ {NOTIFICATION_LABELS['system']}",
+        ])
+        self.assertEqual(labels[5], "❌ 全部通知")
+        self.assertEqual(tuple(NOTIFICATION_LABELS), NOTIFICATION_ORDER)
 
 
 if __name__ == "__main__":
