@@ -1066,13 +1066,14 @@ def notification_kind(exc: Exception) -> str:
 
 
 def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
+    poll_interval = max(1, int(notifier.config.telegram.get("poll_interval_seconds", 2)))
     deadline = time.monotonic() + seconds
     while True:
         notifier.poll_commands()
         remaining = int(deadline - time.monotonic())
         if remaining <= 0:
             return
-        time.sleep(min(30, remaining))
+        time.sleep(min(poll_interval, remaining))
 
 
 def run_loop(config: Config) -> None:
