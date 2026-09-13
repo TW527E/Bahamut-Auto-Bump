@@ -4,7 +4,7 @@ content_template = "頂🆙！\n（{timestamp}）"
 
 [selectors]
 # Keep these configurable because Bahamut may change its markup.
-login_trigger = "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']"
+login_trigger = "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe'], a.main-nav__link:has-text('登入'), a:has-text('登入')"
 login_frame = "iframe[src*='login.php'], dialog iframe"
 username = "#form-login input[name='userid'], input[name='userid']"
 password = "#form-login input[name='password'], input[name='password']"
