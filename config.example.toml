@@ -4,10 +4,25 @@ content_template = "頂🆙！\n（{timestamp}）"
 
 [selectors]
 # Keep these configurable because Bahamut may change its markup.
+login_trigger = "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']"
+login_frame = "iframe[src*='login.php'], dialog iframe"
+username = "#form-login input[name='userid'], input[name='userid']"
+password = "#form-login input[name='password'], input[name='password']"
+totp = "#input-2sa, input[name='twoStepAuth'], input[name='otp'], input[name='code']"
+login_submit = "#form-login button[type='submit'], #form-login input[type='submit'], #btn-login"
+logged_out_selector = "#BH-top-data a[href*='login.php'], a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']"
 post_selector = "#BH-master > section[id^='post_'] .c-post"
 post_time_selector = ".edittime"
 editor = "#editor"
 post_submit = "[data-action='quick-post'], #quick-post, button[type='submit']"
+
+[account]
+# If storage_state is missing or expired, the script logs in by clicking the
+# login link on https://www.gamer.com.tw/ and filling the resulting iframe.
+# Keep this file mode 600 and never commit it.
+username = ""
+password = ""
+totp_secret = ""
 
 [browser]
 headless = true
@@ -15,9 +30,11 @@ navigation_timeout_ms = 30000
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"
-# Required authenticated Playwright storage state. The main script never asks
-# for or enters any Bahamut account credentials.
+# Optional authenticated Playwright storage state. It is preferred when valid;
+# an expired or missing file falls back to the homepage login flow.
 storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
+# Homepage used for automatic login. Do not replace this with login.php.
+homepage_url = "https://www.gamer.com.tw/"
 # Optional explicit path instead of channel detection:
 # executable_path = "/usr/bin/google-chrome-stable"
 

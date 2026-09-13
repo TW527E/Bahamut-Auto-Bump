@@ -86,7 +86,6 @@ def load_config(path: Path) -> Config:
             raise ConfigError(f"Missing [{section}] section")
     required = {
         "thread": ("url",),
-        "browser": ("storage_state",),
         "schedule": ("timezone", "time", "retry_interval_seconds"),
         "telegram": ("bot_token", "target_chat_id", "admin_chat_id"),
     }
@@ -481,20 +480,21 @@ def cleanup_thread(page: Any, config: Config, max_deletions: int = 0) -> int:
 
 def _first_visible(page: Any, selectors: str):
     for selector in selectors.split(","):
-        locator = page.locator(selector.strip()).first
-        if locator.count() and locator.is_visible():
-            return locator
+        selector = selector.strip()
+        if not selector:
+            continue
+        try:
+            locator = page.locator(selector).first
+            if locator.count() and locator.is_visible():
+                return locator
+        except Exception:
+            continue
     return None
 
 
-def verify_imported_session(page: Any, config: Config) -> None:
-    """Require an imported authenticated session; never enter credentials."""
+def _authenticated_thread_page(page: Any, config: Config) -> None:
+    """Navigate to the thread and fail closed unless the account is signed in."""
     timeout = int(config.browser.get("navigation_timeout_ms", 30000))
-    storage_state = str(config.browser.get("storage_state", "")).strip()
-    if not storage_state:
-        raise CannotConfirm("browser.storage_state is required; automatic account/password login is disabled")
-    if not Path(storage_state).exists():
-        raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
     page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
     title = page.title()
@@ -502,14 +502,178 @@ def verify_imported_session(page: Any, config: Config) -> None:
         raise CannotConfirm(
             f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
         )
-    top_login = _first_visible(page, "#BH-top-data a[href*='login.php']")
+    top_login = _first_visible(
+        page,
+        str(config.selectors.get(
+            "logged_out_selector",
+            "#BH-top-data a[href*='login.php'], a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
+        )),
+    )
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     posts = page.locator(selector).count()
     if top_login or not posts:
         raise CannotConfirm(
-            "Imported browser storage_state is expired or not authenticated; export a new session manually"
+            "Bahamut session is expired or not authenticated"
         )
+
+
+def verify_imported_session(page: Any, config: Config) -> None:
+    """Verify an imported storage state without attempting an automatic login."""
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if not storage_state:
+        raise CannotConfirm("browser.storage_state is not configured")
+    if not Path(storage_state).exists():
+        raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
+    try:
+        _authenticated_thread_page(page, config)
+    except CannotConfirm as exc:
+        raise CannotConfirm(
+            f"Imported browser storage_state is expired or not authenticated: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise CannotConfirm(f"Could not verify imported browser storage_state: {exc}") from exc
     LOG.info("Using authenticated Playwright storage state: %s", storage_state)
+
+
+def _login_frame(page: Any, config: Config):
+    selector = str(config.selectors.get("login_frame", "iframe[src*='login.php'], dialog iframe"))
+    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    try:
+        page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+    except Exception as exc:
+        raise CannotConfirm("Homepage login dialog did not render its login form") from exc
+    return page.frame_locator(selector)
+
+
+def _account_credentials(config: Config) -> tuple[str, str, str]:
+    account = config.values.get("account") or {}
+    if not isinstance(account, dict):
+        raise ConfigError("[account] must be a table when provided")
+    username = str(account.get("username", "")).strip()
+    password = str(account.get("password", ""))
+    totp_secret = str(account.get("totp_secret", "")).strip()
+    if not username or not password:
+        raise CannotConfirm(
+            "No valid session is available; configure [account] username and password for homepage login"
+        )
+    return username, password, totp_secret
+
+
+def _totp_code(secret: str) -> str:
+    if not secret:
+        return ""
+    try:
+        import pyotp
+    except ImportError as exc:
+        raise CannotConfirm("TOTP is configured but pyotp is not installed; run pip install -r requirements.txt") from exc
+    try:
+        return pyotp.TOTP(secret.replace(" ", "")).now()
+    except Exception as exc:
+        raise CannotConfirm("Configured TOTP secret is invalid") from exc
+
+
+def login_from_homepage(page: Any, config: Config) -> None:
+    """Open the public homepage, click its login link, then submit the iframe form."""
+    username, password, totp_secret = _account_credentials(config)
+    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    page.set_default_timeout(timeout)
+    homepage = str(config.browser.get("homepage_url", "https://www.gamer.com.tw/"))
+    parsed_homepage = urllib.parse.urlparse(homepage)
+    if (
+        parsed_homepage.scheme != "https"
+        or parsed_homepage.netloc not in {"www.gamer.com.tw", "gamer.com.tw"}
+        or parsed_homepage.path not in {"", "/"}
+    ):
+        raise CannotConfirm("Automatic login homepage_url must be https://www.gamer.com.tw/")
+    page.goto(homepage, wait_until="domcontentloaded")
+    title = page.title()
+    if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
+        raise CannotConfirm(
+            f"Bahamut anti-bot challenge blocked the homepage login; url={page.url!r}, title={title!r}"
+        )
+    trigger = _first_visible(
+        page,
+        str(config.selectors.get(
+            "login_trigger",
+            "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
+        )),
+    )
+    if not trigger:
+        raise CannotConfirm("Homepage login button layout is not recognized")
+    try:
+        trigger.click()
+        frame = _login_frame(page, config)
+    except CannotConfirm:
+        raise
+    except Exception as exc:
+        raise CannotConfirm("Could not open the homepage login dialog") from exc
+
+    username_selector = str(config.selectors.get("username", "#form-login input[name='userid'], input[name='userid']"))
+    password_selector = str(config.selectors.get("password", "#form-login input[name='password'], input[name='password']"))
+    submit_selector = str(config.selectors.get("login_submit", "#form-login button[type='submit'], #form-login input[type='submit'], #btn-login"))
+    totp_selector = str(config.selectors.get("totp", "#input-2sa, input[name='twoStepAuth'], input[name='otp'], input[name='code']"))
+    try:
+        user_field = frame.locator(username_selector).first
+        pass_field = frame.locator(password_selector).first
+        user_field.wait_for(state="visible", timeout=timeout)
+        pass_field.wait_for(state="visible", timeout=timeout)
+        user_field.fill(username)
+        pass_field.fill(password)
+        totp_field = frame.locator(totp_selector).first
+        if totp_secret and totp_field.count() and totp_field.is_visible():
+            totp_field.fill(_totp_code(totp_secret))
+        frame.locator(submit_selector).first.click()
+        if totp_secret:
+            try:
+                totp_field.wait_for(state="visible", timeout=min(timeout, 10000))
+                if totp_field.input_value() == "":
+                    totp_field.fill(_totp_code(totp_secret))
+                    frame.locator(submit_selector).first.click()
+            except Exception:
+                pass
+    except Exception as exc:
+        raise CannotConfirm("Homepage login form layout is not recognized or could not be submitted") from exc
+
+    page.wait_for_timeout(1000)
+    try:
+        _authenticated_thread_page(page, config)
+    except CannotConfirm as exc:
+        raise CannotConfirm(f"Automatic homepage login failed: {exc}") from exc
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if storage_state:
+        Path(storage_state).parent.mkdir(parents=True, exist_ok=True)
+        page.context.storage_state(path=storage_state)
+        try:
+            Path(storage_state).chmod(0o600)
+        except OSError:
+            pass
+        LOG.info("Saved authenticated Playwright storage state: %s", storage_state)
+
+
+def authenticate(page: Any, config: Config) -> None:
+    """Use a valid session first, then fall back to the homepage login flow."""
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if storage_state and Path(storage_state).exists():
+        try:
+            verify_imported_session(page, config)
+            return
+        except CannotConfirm as exc:
+            LOG.warning("Imported session unavailable; attempting homepage login: %s", exc)
+    login_from_homepage(page, config)
+
+
+def _new_context(browser: Any, config: Config):
+    """Create a context, ignoring a malformed optional session for fallback login."""
+    context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
+    storage_state = str(config.browser.get("storage_state", "")).strip()
+    if storage_state and Path(storage_state).exists():
+        context_options["storage_state"] = storage_state
+        try:
+            return browser.new_context(**context_options)
+        except Exception as exc:
+            LOG.warning("Could not load configured storage_state; attempting homepage login: %s", exc)
+            context_options.pop("storage_state", None)
+    return browser.new_context(**context_options)
 
 
 def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
@@ -615,8 +779,6 @@ def run_once(config: Config) -> str:
         raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
     with sync_playwright() as playwright:
         storage_state = str(config.browser.get("storage_state", "")).strip()
-        if storage_state and not Path(storage_state).exists():
-            raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
         launch_options = {
             "headless": bool(config.browser.get("headless", True)),
             "channel": str(config.browser.get("channel", "chrome")),
@@ -627,12 +789,9 @@ def run_once(config: Config) -> str:
         browser = None
         try:
             browser = playwright.chromium.launch(**launch_options)
-            context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
-            if storage_state:
-                context_options["storage_state"] = storage_state
-            context = browser.new_context(**context_options)
+            context = _new_context(browser, config)
             page = context.new_page()
-            verify_imported_session(page, config)
+            authenticate(page, config)
             return inspect_and_maybe_bump(page, config, now)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
@@ -653,8 +812,6 @@ def run_cleanup(config: Config, max_deletions: int = 0) -> int:
         raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
     with sync_playwright() as playwright:
         storage_state = str(config.browser.get("storage_state", "")).strip()
-        if storage_state and not Path(storage_state).exists():
-            raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
         launch_options = {
             "headless": bool(config.browser.get("headless", True)),
             "channel": str(config.browser.get("channel", "chrome")),
@@ -665,12 +822,9 @@ def run_cleanup(config: Config, max_deletions: int = 0) -> int:
         browser = None
         try:
             browser = playwright.chromium.launch(**launch_options)
-            context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
-            if storage_state:
-                context_options["storage_state"] = storage_state
-            context = browser.new_context(**context_options)
+            context = _new_context(browser, config)
             page = context.new_page()
-            verify_imported_session(page, config)
+            authenticate(page, config)
             return cleanup_thread(page, config, max_deletions=max_deletions)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):

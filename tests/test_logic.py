@@ -3,10 +3,13 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 from bahamut_auto_bump import (
+    CannotConfirm,
+    Config,
     NOTIFICATION_LABELS,
     NOTIFICATION_ORDER,
     PostInfo,
     TelegramNotifier,
+    _account_credentials,
     deletion_candidates,
     parse_post_time,
 )
@@ -37,6 +40,21 @@ class TimestampTests(unittest.TestCase):
     def test_bad_timestamp_is_rejected(self):
         with self.assertRaises(Exception):
             parse_post_time("not-a-time", self.tz)
+
+
+class AuthenticationConfigTests(unittest.TestCase):
+    def test_account_credentials_are_required_for_fallback_login(self):
+        config = Config({"account": {}, "browser": {}, "selectors": {}})
+        with self.assertRaises(CannotConfirm):
+            _account_credentials(config)
+
+    def test_account_credentials_allow_optional_totp(self):
+        config = Config({
+            "account": {"username": "user", "password": "pass", "totp_secret": " ABC123 "},
+            "browser": {},
+            "selectors": {},
+        })
+        self.assertEqual(_account_credentials(config), ("user", "pass", "ABC123"))
 
 
 class CleanupTests(unittest.TestCase):
