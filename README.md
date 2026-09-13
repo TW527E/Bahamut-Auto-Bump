@@ -2,11 +2,11 @@
 
 Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特文章，並在能確認「最新樓層不是今天」時發送一次頂文。時區固定由設定中的 `Asia/Taipei`（UTC+8）決定。
 
-安全行為：匯入的 Cookie/session 失效、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。主腳本沒有帳號、密碼或 TOTP 登入功能，只接受手動匯出的 Playwright `storage_state`。
+安全行為：匯入的 Cookie/session 失效、首頁登入失敗、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。腳本會優先使用有效的 Playwright `storage_state`，失效或不存在時才從巴哈姆特首頁右上角登入入口進行帳號、密碼與可選 TOTP 登入；不會直接導向 `login.php`，也不會繞過 CAPTCHA 或站方反爬驗證。
 
 若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chrome，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
 
-請在有圖形介面與正常瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
+若伺服器已能正常使用帳密登入，可在設定檔提供帳號資料；也可以在有圖形介面與正常瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
 
 ```sh
 python export_bahamut_session.py --output bahamut-session.json
@@ -14,12 +14,26 @@ chmod 600 bahamut-session.json
 scp bahamut-session.json root@goodvnic:/opt/Bahamut-Auto-Bump/
 ```
 
-在 Linux 的 `config.toml` 設定：
+在 Linux 的 `config.toml` 設定（`storage_state` 可保留作為優先使用的 session）：
 
 ```toml
 [browser]
 storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 ```
+
+若要啟用 session 失效後的自動登入：
+
+```toml
+[account]
+username = "你的巴哈帳號"
+password = "你的巴哈密碼"
+totp_secret = "你的 TOTP Base32 秘密（沒有就留空）"
+
+[browser]
+homepage_url = "https://www.gamer.com.tw/"
+```
+
+腳本會先開啟 `homepage_url`，點擊首頁右上角「登入」，再填寫登入 iframe 中的欄位。所有登入選擇器都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
 
 這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若 VPS 仍看到 `請稍候...`，代表反爬驗證不接受轉移的 session，應改在被允許的網路環境執行，不能靠腳本繞過驗證。
 
@@ -40,7 +54,7 @@ cp config.example.toml config.toml
 chmod 600 config.toml
 ```
 
-編輯 `config.toml` 的文章網址、每天執行時間、必要的 `browser.storage_state` 路徑，以及 Telegram Bot 的 `bot_token`、目標頻道 `target_chat_id` 和可控制通知的管理者 `admin_chat_id`。先把 Bot 加入目標頻道並授予發文權限；頻道 ID 通常是 `-100...`。管理者先對 Bot 傳訊息，再從 Telegram 的更新資料或 `getUpdates` 取得自己的數字 chat id。若巴哈姆特改版，先用瀏覽器開發者工具確認 `[selectors]` 中的選擇器，再用 `--once` 測試。
+編輯 `config.toml` 的文章網址、每天執行時間、可選的 `browser.storage_state` 路徑與 `[account]` 帳號資料，以及 Telegram Bot 的 `bot_token`、目標頻道 `target_chat_id` 和可控制通知的管理者 `admin_chat_id`。先把 Bot 加入目標頻道並授予發文權限；頻道 ID 通常是 `-100...`。管理者先對 Bot 傳訊息，再從 Telegram 的更新資料或 `getUpdates` 取得自己的數字 chat id。若巴哈姆特改版，先用瀏覽器開發者工具確認 `[selectors]` 中的選擇器，再用 `--once` 測試。
 
 ```sh
 . .venv/bin/activate
