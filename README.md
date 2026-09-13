@@ -33,7 +33,7 @@ totp_secret = "你的 TOTP Base32 秘密（沒有就留空）"
 homepage_url = "https://www.gamer.com.tw/"
 ```
 
-腳本會先開啟 `homepage_url`，點擊首頁右上角「登入」，再填寫登入 iframe 中的欄位。所有登入選擇器都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
+腳本會先開啟 `homepage_url`。若首頁第一次顯示「登入後可從置頂導航搜尋、接收通知與展開個人選單」提示，會先按下 `Close` 關閉，再點擊右上角「登入」，最後填寫登入 iframe 中的欄位；提示不存在時會直接略過。所有登入選擇器（包含 `login_onboarding` 與 `login_onboarding_close`）都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
 
 這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若 VPS 仍看到 `請稍候...`，代表反爬驗證不接受轉移的 session，應改在被允許的網路環境執行，不能靠腳本繞過驗證。
 
