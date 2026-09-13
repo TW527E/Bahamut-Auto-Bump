@@ -613,13 +613,17 @@ def login_from_homepage(page: Any, config: Config) -> None:
         )
     try:
         _dismiss_homepage_onboarding(page, config)
-        trigger = _first_visible(
-            page,
-            str(config.selectors.get(
-                "login_trigger",
-                "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
-            )),
-        )
+        trigger_selector = str(config.selectors.get(
+            "login_trigger",
+            "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe'], a.main-nav__link:has-text('登入'), a:has-text('登入')",
+        ))
+        if ":has-text('登入')" not in trigger_selector:
+            trigger_selector += ", a.main-nav__link:has-text('登入'), a:has-text('登入')"
+        trigger = page.locator(trigger_selector).first
+        try:
+            trigger.wait_for(state="visible", timeout=min(timeout, 10000))
+        except Exception:
+            trigger = _first_visible(page, trigger_selector)
         if not trigger:
             raise CannotConfirm("Homepage login button layout is not recognized")
         trigger.click()
