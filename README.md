@@ -126,6 +126,7 @@ Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天�
 /toggle <類型|all>     切換通知開關狀態
 /session               等待下一則上傳的 session JSON 並替換目前檔案
 /test_cookie           立即測試匯入的 Cookie/session 是否仍有效
+/test_login            忽略現有 session，測試帳號密碼/TOTP 自動登入
 /set_message <訊息>    設定頂文訊息，可使用 {timestamp}
 /set_message default   恢復使用 config.toml 的 content_template
 /status                查看目前啟用的通知
@@ -134,6 +135,6 @@ Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天�
 
 「今天已經頂過」是例行檢查結果，不會發送通知。Telegram API 連線失敗只寫入 systemd 日誌，避免通知失敗造成無限遞迴。Bot 必須能讀取管理者私聊訊息；若使用群組管理指令，請將該群組 ID 設為 `admin_chat_id`。
 
-`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。Cookie/session 失效時，例行檢查仍會將 `auth` 通知送到 `target_chat_id` 頻道。
+`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查仍會將 `auth` 通知送到 `target_chat_id` 頻道。
 
 請勿把 `config.toml` 或 `bahamut-session.json` 提交到 Git，也不要分享匯出的 Cookie/session。使用本工具前請確認符合巴哈姆特帳號安全政策與版規。
