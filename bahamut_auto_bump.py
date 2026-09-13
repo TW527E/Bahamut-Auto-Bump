@@ -545,6 +545,26 @@ def _login_frame(page: Any, config: Config):
     return page.frame_locator(selector)
 
 
+def _dismiss_homepage_onboarding(page: Any, config: Config) -> None:
+    """Close the first-visit driver hint when it blocks the homepage login link."""
+    prompt_selector = str(config.selectors.get("login_onboarding", "#driver-popover-content"))
+    prompt = _first_visible(page, prompt_selector)
+    if not prompt:
+        return
+    close_selector = str(config.selectors.get(
+        "login_onboarding_close",
+        "#driver-popover-content button[aria-label='Close'], #driver-popover-content .driver-popover-close-btn, #driver-popover-content button",
+    ))
+    close = _first_visible(page, close_selector)
+    if not close:
+        raise CannotConfirm("Homepage login onboarding prompt is visible but its close button was not found")
+    try:
+        close.click()
+        prompt.wait_for(state="hidden", timeout=min(int(config.browser.get("navigation_timeout_ms", 30000)), 5000))
+    except Exception as exc:
+        raise CannotConfirm("Could not dismiss the homepage login onboarding prompt") from exc
+
+
 def _account_credentials(config: Config) -> tuple[str, str, str]:
     account = config.values.get("account") or {}
     if not isinstance(account, dict):
@@ -591,16 +611,17 @@ def login_from_homepage(page: Any, config: Config) -> None:
         raise CannotConfirm(
             f"Bahamut anti-bot challenge blocked the homepage login; url={page.url!r}, title={title!r}"
         )
-    trigger = _first_visible(
-        page,
-        str(config.selectors.get(
-            "login_trigger",
-            "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
-        )),
-    )
-    if not trigger:
-        raise CannotConfirm("Homepage login button layout is not recognized")
     try:
+        _dismiss_homepage_onboarding(page, config)
+        trigger = _first_visible(
+            page,
+            str(config.selectors.get(
+                "login_trigger",
+                "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
+            )),
+        )
+        if not trigger:
+            raise CannotConfirm("Homepage login button layout is not recognized")
         trigger.click()
         frame = _login_frame(page, config)
     except CannotConfirm:
