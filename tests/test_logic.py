@@ -86,6 +86,7 @@ class NotificationMenuTests(unittest.TestCase):
     def test_command_menu_uses_toggle_only(self):
         commands = {item["command"] for item in TelegramNotifier.COMMANDS}
         self.assertIn("toggle", commands)
+        self.assertIn("test_login", commands)
         self.assertNotIn("enable", commands)
         self.assertNotIn("disable", commands)
 

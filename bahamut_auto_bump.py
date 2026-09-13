@@ -875,6 +875,40 @@ def test_imported_session(config: Config) -> None:
                 browser.close()
 
 
+def test_automatic_login(config: Config) -> None:
+    """Force a clean homepage login test without relying on an imported session."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
+    launch_options = {
+        "headless": bool(config.browser.get("headless", True)),
+        "channel": str(config.browser.get("channel", "chrome")),
+    }
+    if config.browser.get("executable_path"):
+        launch_options.pop("channel")
+        launch_options["executable_path"] = str(config.browser["executable_path"])
+    browser = None
+    with sync_playwright() as playwright:
+        try:
+            browser = playwright.chromium.launch(**launch_options)
+            context = browser.new_context(
+                locale="zh-TW",
+                timezone_id=config.schedule["timezone"],
+            )
+            page = context.new_page()
+            login_from_homepage(page, config)
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
+                raise CannotConfirm(
+                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
+                ) from exc
+            raise
+        finally:
+            if browser is not None:
+                browser.close()
+
+
 def state_path(config: Config) -> Path:
     return Path(str(config.schedule.get("state_file", "state.json")))
 
@@ -917,6 +951,7 @@ class TelegramNotifier:
         {"command": "toggle", "description": "切換通知狀態（可用按鈕選擇）"},
         {"command": "session", "description": "上傳並替換 Bahamut session"},
         {"command": "test_cookie", "description": "測試 Cookie/session 是否有效"},
+        {"command": "test_login", "description": "測試帳號自動登入"},
         {"command": "set_message", "description": "設定頂文訊息"},
         {"command": "status", "description": "查看通知與訊息設定"},
         {"command": "help", "description": "查看所有指令"},
@@ -1193,6 +1228,12 @@ class TelegramNotifier:
                     self._command_reply("Cookie/session 測試成功，巴哈姆特目前仍是登入狀態。")
                 except Exception as exc:
                     self._command_reply(f"Cookie/session 測試失敗：{exc}")
+            elif name == "/test_login":
+                try:
+                    test_automatic_login(self.config)
+                    self._command_reply("自動登入測試成功，已從巴哈姆特首頁登入。")
+                except Exception as exc:
+                    self._command_reply(f"自動登入測試失敗：{exc}")
             elif name in {"/set_message", "/set_bump_message"}:
                 try:
                     self._set_message(arg_text)
@@ -1203,7 +1244,8 @@ class TelegramNotifier:
             elif name in {"/help", "/start"}:
                 self._command_reply(
                     "指令：/toggle <success|error|auth|layout|system|all>、"
-                    "/session 後上傳 session JSON、/test_cookie、/set_message <訊息>、/status、/help"
+                    "/session 後上傳 session JSON、/test_cookie、/test_login、"
+                    "/set_message <訊息>、/status、/help"
                 )
         self._write_state()
 
