@@ -958,6 +958,22 @@ def scheduled_datetime(now: datetime, config: Config) -> datetime:
     return datetime.combine(now.date(), dt_time(hour, minute), tzinfo=now.tzinfo)
 
 
+TELEGRAM_ALLOWED_HOSTS = {"api.telegram.org"}
+
+
+def _open_telegram_url(url: str, *, timeout: int, data: bytes | None = None) -> Any:
+    """Open a Telegram URL after verifying it targets an allowlisted host over HTTPS.
+
+    Requests only ever go to api.telegram.org; this guard rejects any URL whose
+    scheme or host was not the expected Telegram endpoint before it is fetched.
+    """
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme != "https" or parsed.hostname not in TELEGRAM_ALLOWED_HOSTS:
+        raise RuntimeError(f"Refusing to request non-Telegram URL: {parsed.scheme}://{parsed.hostname}")
+    request = urllib.request.Request(url, data=data, method="POST" if data is not None else "GET")
+    return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - host allowlisted above
+
+
 NOTIFICATION_TYPES = {"success", "error", "auth", "layout", "system"}
 NOTIFICATION_LABELS = {
     "success": "成功通知",
@@ -1034,8 +1050,7 @@ class TelegramNotifier:
     def _api(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         encoded = urllib.parse.urlencode(params).encode("utf-8")
-        request = urllib.request.Request(url, data=encoded, method="POST")
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with _open_telegram_url(url, timeout=15, data=encoded) as response:
             payload = json.loads(response.read().decode("utf-8"))
         if not payload.get("ok"):
             raise RuntimeError(str(payload))
@@ -1045,11 +1060,13 @@ class TelegramNotifier:
         if kind in self.disabled:
             LOG.info("Telegram notification type %s is disabled", kind)
             return
-        prefix = "✅" if kind == "success" else "❌" if kind in {"error", "auth", "layout", "system"} else ""
+        is_failure = kind in {"error", "auth", "layout", "system"}
+        prefix = "✅" if kind == "success" else "❌" if is_failure else ""
         if prefix and not text.startswith(prefix):
             text = f"{prefix} {text}"
+        chat_id = self.admin_chat_id if is_failure else self.target_chat_id
         try:
-            self._api("sendMessage", {"chat_id": self.target_chat_id, "text": text})
+            self._api("sendMessage", {"chat_id": chat_id, "text": text})
         except Exception as exc:
             LOG.warning("Telegram notification failed: %s", exc)
 
@@ -1147,7 +1164,7 @@ class TelegramNotifier:
         if not file_path:
             raise RuntimeError("Telegram did not return a session file path")
         url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
-        with urllib.request.urlopen(url, timeout=30) as response:
+        with _open_telegram_url(url, timeout=30) as response:
             raw = response.read(5 * 1024 * 1024 + 1)
         if len(raw) > 5 * 1024 * 1024:
             raise RuntimeError("Session file is too large")
