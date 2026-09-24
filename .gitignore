@@ -1,7 +1,12 @@
 config.toml
 state.json
 state.json.tmp
+state.json.lock
+telegram_state.json
+telegram_state.json.tmp
 .venv/
 __pycache__/
 *.pyc
 bahamut-session.json
+.mimosa/
+.zcodeignore

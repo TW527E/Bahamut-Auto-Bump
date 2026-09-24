@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
@@ -12,6 +13,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, datetime, time as dt_time, timedelta
 from pathlib import Path
@@ -335,6 +337,8 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
                 raise CannotConfirm(f"Could not determine floor for post {row.get('sn')}")
             if not row.get("raw"):
                 raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
+            if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
+                raise CannotConfirm("Could not determine a valid post number")
             result.append(PostInfo(floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), str(row.get("text", ""))))
     if not result:
         raise CannotConfirm("No posts were found for cleanup")
@@ -437,19 +441,67 @@ def verify_post_deleted(page: Any, config: Config, post: PostInfo) -> None:
         raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
 
 
-def cleanup_previous_reply(page: Any, config: Config) -> bool:
-    posts = collect_posts(page, config)
-    candidates = deletion_candidates(posts, keep_latest_replies=1)
-    if not candidates:
-        LOG.info("No previous owned reply is available for cleanup")
-        return False
-    target = candidates[0]
-    if bool(config.cleanup.get("dry_run", True)):
-        LOG.info("Cleanup dry-run: would delete floor %s (sn=%s)", target.floor, target.sn)
-        return False
-    delete_post(page, config, target)
+def cleanup_previous_reply(page: Any, config: Config, target: PostInfo, posts: list[PostInfo]) -> None:
+    current = next((post for post in posts if post.sn == target.sn), None)
+    if current is not None:
+        if current not in deletion_candidates(posts, keep_latest_replies=1):
+            raise CannotConfirm(f"Pending cleanup post {target.sn} is no longer an older owned reply")
+        if not config.cleanup.get("enabled", False) or config.cleanup.get("dry_run", True):
+            raise CannotConfirm("Pending cleanup is paused while cleanup is disabled or dry-run")
+        delay = max(5, int(config.cleanup.get("after_bump_delay_seconds", 5)))
+        LOG.info("Waiting %s seconds before deleting previous bump sn=%s", delay, target.sn)
+        time.sleep(delay)
+        delete_post(page, config, current)
     verify_post_deleted(page, config, target)
-    LOG.info("Deleted previous bump floor %s (sn=%s)", target.floor, target.sn)
+    LOG.info("Confirmed previous bump is deleted (sn=%s)", target.sn)
+
+
+def finish_pending_bump(
+    page: Any, config: Config, state: dict[str, Any], posts: list[PostInfo], now: datetime,
+) -> bool:
+    pending = state["pending_bump"]
+    try:
+        if not isinstance(pending, dict) or pending["thread_url"] != str(config.thread["url"]):
+            raise ValueError("Pending bump belongs to a different thread")
+        before_sn = pending["before_sn"]
+        if type(before_sn) is not int or before_sn <= 0:
+            raise ValueError("Invalid pre-bump post number")
+        target = pending["previous_reply"]
+        if target is not None:
+            if (
+                not isinstance(target, dict)
+                or type(target["floor"]) is not int
+                or target["floor"] <= 1
+                or not isinstance(target["sn"], str)
+                or not re.fullmatch(r"[0-9]+", target["sn"])
+                or not 0 < int(target["sn"]) <= before_sn
+            ):
+                raise ValueError("Invalid pending cleanup target")
+        if "posted_sn" in pending and date.fromisoformat(pending["posted_date"]) > now.date():
+            raise ValueError("Confirmed bump date is in the future")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise CannotConfirm(f"Invalid pending bump state: {exc}") from exc
+
+    if "posted_sn" not in pending:
+        replies = [post for post in posts if post.owner and post.floor > 1 and int(post.sn) > before_sn]
+        if not replies:
+            return False
+        posted = min(replies, key=lambda post: int(post.sn))
+        posted_at = parse_post_time(posted.raw_time, now.tzinfo, now)
+        if posted_at.date() > now.date():
+            raise CannotConfirm("New reply has a future timestamp")
+        pending["posted_sn"] = posted.sn
+        pending["posted_date"] = posted_at.date().isoformat()
+        write_state(state_path(config), state)
+        LOG.info("Confirmed submitted bump sn=%s at %s", posted.sn, posted_at.isoformat())
+
+    if target is not None:
+        cleanup_previous_reply(
+            page, config, PostInfo(target["floor"], target["sn"], True, "", ""), posts,
+        )
+    state["last_confirmed_date"] = pending["posted_date"]
+    del state["pending_bump"]
+    write_state(state_path(config), state)
     return True
 
 
@@ -706,6 +758,12 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
         raise CannotConfirm("Playwright is required; run pip install -r requirements.txt") from exc
+    path = state_path(config)
+    state = read_state(path)
+    recovered = False
+    if "pending_bump" in state:
+        LOG.info("Checking the previous unfinished bump before starting another")
+        recovered = finish_pending_bump(page, config, state, collect_posts(page, config), now)
     page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
     selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
@@ -715,10 +773,36 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         raise CannotConfirm("Thread posts did not load in time") from exc
     _navigate_to_last_page(page, config)
     latest = latest_post_timestamp(page, config, now)
-    if is_today(latest, now):
-        LOG.info("Latest post is dated %s; today's bump is already present", latest.isoformat())
-        return "already_done"
+    if is_today(latest, now) or state.get("last_confirmed_date") == now.date().isoformat():
+        LOG.info("Today's bump is already present; no additional reply is needed")
+        state.pop("pending_bump", None)
+        state["last_confirmed_date"] = now.date().isoformat()
+        write_state(path, state)
+        return "recovered" if recovered else "already_done"
 
+    posts = collect_posts(page, config)
+    previous = deletion_candidates(posts, keep_latest_replies=0)
+    target = previous[0] if previous else None
+    if not config.cleanup.get("enabled", False):
+        target = None
+    elif config.cleanup.get("dry_run", True):
+        if target:
+            LOG.info("Cleanup dry-run: would delete floor %s (sn=%s) after a successful bump", target.floor, target.sn)
+        target = None
+    state["pending_bump"] = {
+        "thread_url": str(config.thread["url"]),
+        "before_sn": max(int(post.sn) for post in posts),
+        "previous_reply": {"floor": target.floor, "sn": target.sn} if target else None,
+    }
+    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+    page.locator(selector).first.wait_for(state="attached")
+    _navigate_to_last_page(page, config)
+    if is_today(latest_post_timestamp(page, config, now), now):
+        state.pop("pending_bump", None)
+        state["last_confirmed_date"] = now.date().isoformat()
+        write_state(path, state)
+        return "recovered" if recovered else "already_done"
+    write_state(path, state)
     body = str(config.thread.get("content_template", "頂🆙！\n（{timestamp}）")).format(
         timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     )
@@ -777,21 +861,11 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         LOG.warning("Reply navigation timed out; checking from an independent page")
     verification_page = page.context.new_page()
     try:
-        verification_page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
-        verification_page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
-        verification_page.locator(selector).first.wait_for(state="attached")
-        _navigate_to_last_page(verification_page, config)
-        verified = latest_post_timestamp(verification_page, config, now)
+        verified_posts = collect_posts(verification_page, config)
     finally:
         verification_page.close()
-    if not is_today(verified, now):
-        raise CannotConfirm("Reply was submitted but the latest post could not be verified as today")
-    LOG.info("Bump submitted and verified at %s", verified.isoformat())
-    if bool(config.cleanup.get("enabled", False)):
-        delay = max(5, int(config.cleanup.get("after_bump_delay_seconds", 5)))
-        LOG.info("Waiting %s seconds before cleaning the previous reply", delay)
-        time.sleep(delay)
-        cleanup_previous_reply(page, config)
+    if not finish_pending_bump(page, config, state, verified_posts, now):
+        raise CannotConfirm("Reply was submitted but no new owned reply could be verified")
     return "posted"
 
 
@@ -802,7 +876,7 @@ def run_once(config: Config) -> str:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
     except ImportError as exc:
         raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    with sync_playwright() as playwright:
+    with bump_lock(config), sync_playwright() as playwright:
         storage_state = str(config.browser.get("storage_state", "")).strip()
         launch_options = {
             "headless": bool(config.browser.get("headless", True)),
@@ -835,7 +909,7 @@ def run_cleanup(config: Config, max_deletions: int = 0) -> int:
         from playwright.sync_api import sync_playwright
     except ImportError as exc:
         raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    with sync_playwright() as playwright:
+    with bump_lock(config), sync_playwright() as playwright:
         storage_state = str(config.browser.get("storage_state", "")).strip()
         launch_options = {
             "headless": bool(config.browser.get("headless", True)),
@@ -938,19 +1012,39 @@ def state_path(config: Config) -> Path:
     return Path(str(config.schedule.get("state_file", "state.json")))
 
 
-def read_state(path: Path) -> date | None:
+def read_state(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return date.fromisoformat(value.get("last_confirmed_date", ""))
-    except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
-        return None
+    except FileNotFoundError:
+        return {}
+    except (ValueError, UnicodeError) as exc:
+        raise CannotConfirm(f"Could not read bump recovery state: {path}") from exc
+    if not isinstance(value, dict):
+        raise CannotConfirm(f"Invalid bump recovery state: {path}")
+    return value
 
 
-def write_state(path: Path, confirmed: date) -> None:
+def write_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps({"last_confirmed_date": confirmed.isoformat()}), encoding="utf-8")
+    with temporary.open("w", encoding="utf-8") as output:
+        json.dump(state, output, ensure_ascii=False)
+        output.flush()
+        os.fsync(output.fileno())
     temporary.replace(path)
+
+
+@contextmanager
+def bump_lock(config: Config):
+    path = state_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # Closing the fd releases the flock, so no explicit unlock is needed.
+    with path.with_suffix(path.suffix + ".lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise CannotConfirm("Another bump or cleanup is already running") from exc
+        yield
 
 
 def scheduled_datetime(now: datetime, config: Config) -> datetime:
@@ -1321,22 +1415,22 @@ def run_loop(config: Config) -> None:
     while True:
         notifier.poll_commands()
         now = taiwan_now(config)
-        confirmed = read_state(path)
-        due = scheduled_datetime(now, config)
-        if confirmed == now.date():
-            tomorrow = due + timedelta(days=1)
-            sleep_for = max(30, int((tomorrow - now).total_seconds()))
-            LOG.info("Today's state is confirmed; next check in %s seconds", sleep_for)
-            sleep_with_telegram(min(sleep_for, 3600), notifier)
-            continue
-        if now < due:
-            sleep_with_telegram(min(max(30, int((due - now).total_seconds())), 3600), notifier)
-            continue
         try:
+            state = read_state(path)
+            due = scheduled_datetime(now, config)
+            if state.get("last_confirmed_date") == now.date().isoformat() and "pending_bump" not in state:
+                tomorrow = due + timedelta(days=1)
+                sleep_for = max(30, int((tomorrow - now).total_seconds()))
+                LOG.info("Today's state is confirmed; next check in %s seconds", sleep_for)
+                sleep_with_telegram(min(sleep_for, 3600), notifier)
+                continue
+            if now < due:
+                sleep_with_telegram(min(max(30, int((due - now).total_seconds())), 3600), notifier)
+                continue
             result = run_once(notifier.configured(config))
-            write_state(path, now.date())
-            if result == "posted":
-                notifier.send("success", f"巴哈姆特頂文成功\n文章：{config.thread['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
+            if result in {"posted", "recovered"}:
+                message = "巴哈姆特頂文成功" if result == "posted" else "巴哈姆特上次頂文與清理已補完"
+                notifier.send("success", f"{message}\n文章：{config.thread['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
         except Exception as exc:
             LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, retry)
             notifier.send(notification_kind(exc), f"巴哈姆特自動頂文發生問題\n文章：{config.thread['url']}\n類型：{notification_kind(exc)}\n原因：{exc}")
@@ -1367,6 +1461,8 @@ def main() -> int:
             result = run_once(notifier.configured(config))
             if result == "posted":
                 notifier.send("success", f"巴哈姆特頂文成功\n文章：{config.thread['url']}")
+            elif result == "recovered":
+                notifier.send("success", f"巴哈姆特上次頂文與清理已補完\n文章：{config.thread['url']}")
         else:
             run_loop(config)
         return 0
