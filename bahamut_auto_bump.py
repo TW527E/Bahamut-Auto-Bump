@@ -33,44 +33,14 @@ class CannotConfirm(RuntimeError):
 
 
 @dataclass(frozen=True)
-class Config:
-    values: dict[str, Any]
-
-    @property
-    def thread(self) -> dict[str, Any]:
-        return self.values["thread"]
-
-    @property
-    def selectors(self) -> dict[str, Any]:
-        return self.values["selectors"]
-
-    @property
-    def browser(self) -> dict[str, Any]:
-        return self.values["browser"]
-
-    @property
-    def schedule(self) -> dict[str, Any]:
-        return self.values["schedule"]
-
-    @property
-    def telegram(self) -> dict[str, Any]:
-        return self.values["telegram"]
-
-    @property
-    def cleanup(self) -> dict[str, Any]:
-        return self.values.get("cleanup", {})
-
-
-@dataclass(frozen=True)
 class PostInfo:
     floor: int
     sn: str
     owner: bool
     raw_time: str
-    text: str
 
 
-def load_config(path: Path) -> Config:
+def load_config(path: Path) -> dict[str, Any]:
     try:
         import tomllib
     except ImportError as exc:  # pragma: no cover - Python 3.10 fallback message
@@ -102,11 +72,12 @@ def load_config(path: Path) -> Config:
             raise ConfigError("retry_interval_seconds must be at least 30")
     except (KeyError, ValueError, TypeError) as exc:
         raise ConfigError(f"Invalid schedule setting: {exc}") from exc
-    return Config(data)
+    data.setdefault("cleanup", {})
+    return data
 
 
-def taiwan_now(config: Config) -> datetime:
-    return datetime.now(ZoneInfo(config.schedule["timezone"]))
+def taiwan_now(config: dict[str, Any]) -> datetime:
+    return datetime.now(ZoneInfo(config["schedule"]["timezone"]))
 
 
 def parse_post_time(raw: str, timezone: ZoneInfo, reference: datetime | None = None) -> datetime:
@@ -126,22 +97,14 @@ def parse_post_time(raw: str, timezone: ZoneInfo, reference: datetime | None = N
     textual = re.search(r"\d{4}(?:[-/]\d{2}[-/]\d{2}|年\d{2}月\d{2}日)\s+\d{2}:\d{2}(?::\d{2})?", value)
     if textual:
         value = textual.group(0)
-    value = value.replace("年", "-").replace("月", "-").replace("日", "")
+    value = value.replace("年", "-").replace("月", "-").replace("日", "").replace("/", "-")
     value = re.sub(r"\s+", " ", value)
     if value.endswith("Z"):
         value = value[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(value)
-    except ValueError:
-        parsed = None
-        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y/%m/%d %H:%M:%S", "%Y/%m/%d %H:%M"):
-            try:
-                parsed = datetime.strptime(value, fmt)
-                break
-            except ValueError:
-                continue
-        if parsed is None:
-            raise CannotConfirm(f"Unparseable post timestamp: {raw!r}")
+    except ValueError as exc:
+        raise CannotConfirm(f"Unparseable post timestamp: {raw!r}") from exc
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone)
     return parsed.astimezone(timezone)
@@ -151,49 +114,26 @@ def is_today(parsed: datetime, now: datetime) -> bool:
     return parsed.astimezone(now.tzinfo).date() == now.date()
 
 
-def _navigate_to_last_page(page: Any, config: Config) -> None:
+def _navigate_to_last_page(page: Any, config: dict[str, Any]) -> None:
+    """Jump to the newest thread page, staying put when no later page is advertised."""
     current = urllib.parse.urlparse(str(page.url))
-    current_query = urllib.parse.parse_qs(current.query)
-    current_page = int(current_query.get("page", ["1"])[0])
-    try:
-        hrefs = page.locator("a[href*='page=']").evaluate_all(
-            "links => links.map((link) => link.href).filter(Boolean)"
-        )
-    except Exception as exc:
-        raise CannotConfirm(f"Could not inspect thread pagination: {exc}") from exc
-
-    page_numbers = {current_page}
-    for href in hrefs:
-        parsed = urllib.parse.urlparse(str(href))
-        query = urllib.parse.parse_qs(parsed.query)
-        if parsed.path != current.path:
-            continue
-        if query.get("bsn") != current_query.get("bsn") or query.get("snA") != current_query.get("snA"):
-            continue
-        try:
-            page_numbers.add(int(query.get("page", [""])[0]))
-        except ValueError:
-            continue
-
-    last_page = max(page_numbers)
-    if last_page <= current_page:
+    current_page = int(urllib.parse.parse_qs(current.query).get("page", ["1"])[0])
+    urls = _thread_page_urls(page, config)
+    if len(urls) <= current_page:
         return
-    current_query["page"] = [str(last_page)]
-    target = urllib.parse.urlunparse(
-        current._replace(query=urllib.parse.urlencode(current_query, doseq=True))
-    )
-    page.goto(target, wait_until="domcontentloaded")
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    page.goto(urls[-1], wait_until="domcontentloaded")
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
-        page.locator(selector).first.wait_for(state="attached", timeout=timeout)
+        page.locator(selector).first.wait_for(
+            state="attached", timeout=int(config["browser"].get("navigation_timeout_ms", 30000))
+        )
     except Exception as exc:
         raise CannotConfirm("The last thread page did not load its posts in time") from exc
 
 
-def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-    time_selector = str(config.selectors.get("post_time_selector", "time[datetime], .edittime, .c-post__header time"))
+def latest_post_timestamp(page: Any, config: dict[str, Any], now: datetime) -> datetime:
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    time_selector = str(config["selectors"].get("post_time_selector", "time[datetime], .edittime, .c-post__header time"))
     try:
         result = page.locator(selector).evaluate_all(
             """
@@ -217,7 +157,7 @@ def latest_post_timestamp(page: Any, config: Config, now: datetime) -> datetime:
     return parse_post_time(result[-1]["raw"], now.tzinfo, now)
 
 
-def _thread_page_urls(page: Any, config: Config) -> list[str]:
+def _thread_page_urls(page: Any, config: dict[str, Any]) -> list[str]:
     """Return every numbered page URL advertised by the thread pagination."""
     current = urllib.parse.urlparse(str(page.url))
     current_query = urllib.parse.parse_qs(current.query)
@@ -247,14 +187,14 @@ def _thread_page_urls(page: Any, config: Config) -> list[str]:
     return urls
 
 
-def collect_posts(page: Any, config: Config) -> list[PostInfo]:
+def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
     """Load all thread pages and collect only data needed for safe cleanup."""
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-    time_selector = str(config.selectors.get("post_time_selector", ".edittime"))
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    time_selector = str(config["selectors"].get("post_time_selector", ".edittime"))
     page.set_default_timeout(timeout)
     try:
-        configured = urllib.parse.urlparse(str(config.thread["url"]))
+        configured = urllib.parse.urlparse(str(config["thread"]["url"]))
         current = urllib.parse.urlparse(str(page.url))
         configured_query = urllib.parse.parse_qs(configured.query)
         current_query = urllib.parse.parse_qs(current.query)
@@ -264,7 +204,7 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
             and current_query.get("snA") == configured_query.get("snA")
         )
         if not same_thread or page.locator(selector).count() == 0:
-            page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+            page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
         page.locator(selector).first.wait_for(state="attached", timeout=timeout)
         page_urls = _thread_page_urls(page, config)
     except Exception as exc:
@@ -312,8 +252,7 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
                     floor: (floorLink?.textContent || '').match(/(\\d+)\\s*樓/)?.[1] || '',
                     sn: String(meta.sn || section.id.replace(/^post_/, '')),
                     owner: meta.owner === true,
-                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || '',
-                    text: (section.innerText || '').trim()
+                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || ''
                   };
                 }).filter(item => item.sn)
                 """,
@@ -339,7 +278,7 @@ def collect_posts(page: Any, config: Config) -> list[PostInfo]:
                 raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
             if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
                 raise CannotConfirm("Could not determine a valid post number")
-            result.append(PostInfo(floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), str(row.get("text", ""))))
+            result.append(PostInfo(floor, str(row["sn"]), bool(row["owner"]), str(row["raw"])))
     if not result:
         raise CannotConfirm("No posts were found for cleanup")
     return sorted({post.sn: post for post in result}.values(), key=lambda post: post.floor)
@@ -398,12 +337,12 @@ def _delete_request(page: Any, sn: str) -> dict[str, str]:
     return request
 
 
-def delete_post(page: Any, config: Config, post: PostInfo) -> None:
+def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
     # pdel is generated on thread pages and contains the current delete token.
-    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     page.locator(selector).first.wait_for(
-        state="attached", timeout=int(config.browser.get("navigation_timeout_ms", 30000))
+        state="attached", timeout=int(config["browser"].get("navigation_timeout_ms", 30000))
     )
     request = _delete_request(page, post.sn)
     if request["cookie"]:
@@ -420,19 +359,19 @@ def delete_post(page: Any, config: Config, post: PostInfo) -> None:
         LOG.warning("Delete navigation ended early; verifying the post: %s", exc)
 
 
-def verify_post_deleted(page: Any, config: Config, post: PostInfo) -> None:
+def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> None:
     """Verify one deletion through Bahamut's canonical single-post URL."""
-    thread = urllib.parse.urlparse(str(config.thread["url"]))
+    thread = urllib.parse.urlparse(str(config["thread"]["url"]))
     query = urllib.parse.parse_qs(thread.query)
     bsn = query.get("bsn", [""])[0]
     if not bsn:
         raise CannotConfirm("Thread URL has no bsn for deletion verification")
     verification_url = urllib.parse.urljoin(
-        str(config.thread["url"]),
+        str(config["thread"]["url"]),
         "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": post.sn}),
     )
     page.goto(verification_url, wait_until="domcontentloaded")
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     page.locator("body").wait_for(state="attached", timeout=timeout)
     if page.locator(f"#post_{post.sn}").count():
         raise CannotConfirm(f"Delete request completed but floor {post.floor} is still present")
@@ -441,14 +380,14 @@ def verify_post_deleted(page: Any, config: Config, post: PostInfo) -> None:
         raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
 
 
-def cleanup_previous_reply(page: Any, config: Config, target: PostInfo, posts: list[PostInfo]) -> None:
+def cleanup_previous_reply(page: Any, config: dict[str, Any], target: PostInfo, posts: list[PostInfo]) -> None:
     current = next((post for post in posts if post.sn == target.sn), None)
     if current is not None:
         if current not in deletion_candidates(posts, keep_latest_replies=1):
             raise CannotConfirm(f"Pending cleanup post {target.sn} is no longer an older owned reply")
-        if not config.cleanup.get("enabled", False) or config.cleanup.get("dry_run", True):
+        if not config["cleanup"].get("enabled", False) or config["cleanup"].get("dry_run", True):
             raise CannotConfirm("Pending cleanup is paused while cleanup is disabled or dry-run")
-        delay = max(5, int(config.cleanup.get("after_bump_delay_seconds", 5)))
+        delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
         LOG.info("Waiting %s seconds before deleting previous bump sn=%s", delay, target.sn)
         time.sleep(delay)
         delete_post(page, config, current)
@@ -457,11 +396,11 @@ def cleanup_previous_reply(page: Any, config: Config, target: PostInfo, posts: l
 
 
 def finish_pending_bump(
-    page: Any, config: Config, state: dict[str, Any], posts: list[PostInfo], now: datetime,
+    page: Any, config: dict[str, Any], state: dict[str, Any], posts: list[PostInfo], now: datetime,
 ) -> bool:
     pending = state["pending_bump"]
     try:
-        if not isinstance(pending, dict) or pending["thread_url"] != str(config.thread["url"]):
+        if not isinstance(pending, dict) or pending["thread_url"] != str(config["thread"]["url"]):
             raise ValueError("Pending bump belongs to a different thread")
         before_sn = pending["before_sn"]
         if type(before_sn) is not int or before_sn <= 0:
@@ -497,7 +436,7 @@ def finish_pending_bump(
 
     if target is not None:
         cleanup_previous_reply(
-            page, config, PostInfo(target["floor"], target["sn"], True, "", ""), posts,
+            page, config, PostInfo(target["floor"], target["sn"], True, ""), posts,
         )
     state["last_confirmed_date"] = pending["posted_date"]
     del state["pending_bump"]
@@ -505,17 +444,17 @@ def finish_pending_bump(
     return True
 
 
-def cleanup_thread(page: Any, config: Config, max_deletions: int = 0) -> int:
+def cleanup_thread(page: Any, config: dict[str, Any], max_deletions: int = 0) -> int:
     posts = collect_posts(page, config)
-    keep = int(config.cleanup.get("keep_latest_replies", 1))
+    keep = int(config["cleanup"].get("keep_latest_replies", 1))
     candidates = deletion_candidates(posts, keep_latest_replies=keep)
     if max_deletions > 0:
         candidates = candidates[:max_deletions]
     if not candidates:
         LOG.info("No cleanup candidates; floor 1 and the newest %s owned replies are retained", keep)
         return 0
-    dry_run = bool(config.cleanup.get("dry_run", True))
-    interval = max(5, int(config.cleanup.get("interval_seconds", 5)))
+    dry_run = bool(config["cleanup"].get("dry_run", True))
+    interval = max(5, int(config["cleanup"].get("interval_seconds", 5)))
     deleted = 0
     for index, target in enumerate(candidates):
         if dry_run:
@@ -544,10 +483,10 @@ def _first_visible(page: Any, selectors: str):
     return None
 
 
-def _authenticated_thread_page(page: Any, config: Config) -> None:
+def _authenticated_thread_page(page: Any, config: dict[str, Any]) -> None:
     """Navigate to the thread and fail closed unless the account is signed in."""
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
-    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
+    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
     page.set_default_timeout(timeout)
     title = page.title()
     if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
@@ -556,12 +495,12 @@ def _authenticated_thread_page(page: Any, config: Config) -> None:
         )
     top_login = _first_visible(
         page,
-        str(config.selectors.get(
+        str(config["selectors"].get(
             "logged_out_selector",
             "#BH-top-data a[href*='login.php'], a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']",
         )),
     )
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     posts = page.locator(selector).count()
     if top_login or not posts:
         raise CannotConfirm(
@@ -569,9 +508,9 @@ def _authenticated_thread_page(page: Any, config: Config) -> None:
         )
 
 
-def verify_imported_session(page: Any, config: Config) -> None:
+def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
     """Verify an imported storage state without attempting an automatic login."""
-    storage_state = str(config.browser.get("storage_state", "")).strip()
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
     if not storage_state:
         raise CannotConfirm("browser.storage_state is not configured")
     if not Path(storage_state).exists():
@@ -587,9 +526,9 @@ def verify_imported_session(page: Any, config: Config) -> None:
     LOG.info("Using authenticated Playwright storage state: %s", storage_state)
 
 
-def _login_frame(page: Any, config: Config):
-    selector = str(config.selectors.get("login_frame", "iframe[src*='login.php'], dialog iframe"))
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+def _login_frame(page: Any, config: dict[str, Any]):
+    selector = str(config["selectors"].get("login_frame", "iframe[src*='login.php'], dialog iframe"))
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     try:
         page.locator(selector).first.wait_for(state="attached", timeout=timeout)
     except Exception as exc:
@@ -597,13 +536,13 @@ def _login_frame(page: Any, config: Config):
     return page.frame_locator(selector)
 
 
-def _dismiss_homepage_onboarding(page: Any, config: Config) -> None:
+def _dismiss_homepage_onboarding(page: Any, config: dict[str, Any]) -> None:
     """Close the first-visit driver hint when it blocks the homepage login link."""
-    prompt_selector = str(config.selectors.get("login_onboarding", "#driver-popover-content"))
+    prompt_selector = str(config["selectors"].get("login_onboarding", "#driver-popover-content"))
     prompt = _first_visible(page, prompt_selector)
     if not prompt:
         return
-    close_selector = str(config.selectors.get(
+    close_selector = str(config["selectors"].get(
         "login_onboarding_close",
         "#driver-popover-content button[aria-label='Close'], #driver-popover-content .driver-popover-close-btn, #driver-popover-content button",
     ))
@@ -612,13 +551,13 @@ def _dismiss_homepage_onboarding(page: Any, config: Config) -> None:
         raise CannotConfirm("Homepage login onboarding prompt is visible but its close button was not found")
     try:
         close.click()
-        prompt.wait_for(state="hidden", timeout=min(int(config.browser.get("navigation_timeout_ms", 30000)), 5000))
+        prompt.wait_for(state="hidden", timeout=min(int(config["browser"].get("navigation_timeout_ms", 30000)), 5000))
     except Exception as exc:
         raise CannotConfirm("Could not dismiss the homepage login onboarding prompt") from exc
 
 
-def _account_credentials(config: Config) -> tuple[str, str, str]:
-    account = config.values.get("account") or {}
+def _account_credentials(config: dict[str, Any]) -> tuple[str, str, str]:
+    account = config.get("account") or {}
     if not isinstance(account, dict):
         raise ConfigError("[account] must be a table when provided")
     username = str(account.get("username", "")).strip()
@@ -637,19 +576,19 @@ def _totp_code(secret: str) -> str:
     try:
         import pyotp
     except ImportError as exc:
-        raise CannotConfirm("TOTP is configured but pyotp is not installed; run pip install -r requirements.txt") from exc
+        raise CannotConfirm('TOTP is configured but pyotp is not installed; run pip install "pyotp>=2.9,<3"') from exc
     try:
         return pyotp.TOTP(secret.replace(" ", "")).now()
     except Exception as exc:
         raise CannotConfirm("Configured TOTP secret is invalid") from exc
 
 
-def login_from_homepage(page: Any, config: Config) -> None:
+def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     """Open the public homepage, click its login link, then submit the iframe form."""
     username, password, totp_secret = _account_credentials(config)
-    timeout = int(config.browser.get("navigation_timeout_ms", 30000))
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     page.set_default_timeout(timeout)
-    homepage = str(config.browser.get("homepage_url", "https://www.gamer.com.tw/"))
+    homepage = str(config["browser"].get("homepage_url", "https://www.gamer.com.tw/"))
     parsed_homepage = urllib.parse.urlparse(homepage)
     if (
         parsed_homepage.scheme != "https"
@@ -665,7 +604,7 @@ def login_from_homepage(page: Any, config: Config) -> None:
         )
     try:
         _dismiss_homepage_onboarding(page, config)
-        trigger_selector = str(config.selectors.get(
+        trigger_selector = str(config["selectors"].get(
             "login_trigger",
             "a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe'], a.main-nav__link:has-text('登入'), a:has-text('登入')",
         ))
@@ -685,10 +624,10 @@ def login_from_homepage(page: Any, config: Config) -> None:
     except Exception as exc:
         raise CannotConfirm("Could not open the homepage login dialog") from exc
 
-    username_selector = str(config.selectors.get("username", "#form-login input[name='userid'], input[name='userid']"))
-    password_selector = str(config.selectors.get("password", "#form-login input[name='password'], input[name='password']"))
-    submit_selector = str(config.selectors.get("login_submit", "#form-login button[type='submit'], #form-login input[type='submit'], #btn-login"))
-    totp_selector = str(config.selectors.get("totp", "#input-2sa, input[name='twoStepAuth'], input[name='otp'], input[name='code']"))
+    username_selector = str(config["selectors"].get("username", "#form-login input[name='userid'], input[name='userid']"))
+    password_selector = str(config["selectors"].get("password", "#form-login input[name='password'], input[name='password']"))
+    submit_selector = str(config["selectors"].get("login_submit", "#form-login button[type='submit'], #form-login input[type='submit'], #btn-login"))
+    totp_selector = str(config["selectors"].get("totp", "#input-2sa, input[name='twoStepAuth'], input[name='otp'], input[name='code']"))
     try:
         user_field = frame.locator(username_selector).first
         pass_field = frame.locator(password_selector).first
@@ -700,14 +639,6 @@ def login_from_homepage(page: Any, config: Config) -> None:
         if totp_secret and totp_field.count() and totp_field.is_visible():
             totp_field.fill(_totp_code(totp_secret))
         frame.locator(submit_selector).first.click()
-        if totp_secret:
-            try:
-                totp_field.wait_for(state="visible", timeout=min(timeout, 10000))
-                if totp_field.input_value() == "":
-                    totp_field.fill(_totp_code(totp_secret))
-                    frame.locator(submit_selector).first.click()
-            except Exception:
-                pass
     except Exception as exc:
         raise CannotConfirm("Homepage login form layout is not recognized or could not be submitted") from exc
 
@@ -716,7 +647,7 @@ def login_from_homepage(page: Any, config: Config) -> None:
         _authenticated_thread_page(page, config)
     except CannotConfirm as exc:
         raise CannotConfirm(f"Automatic homepage login failed: {exc}") from exc
-    storage_state = str(config.browser.get("storage_state", "")).strip()
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
     if storage_state:
         Path(storage_state).parent.mkdir(parents=True, exist_ok=True)
         page.context.storage_state(path=storage_state)
@@ -727,9 +658,9 @@ def login_from_homepage(page: Any, config: Config) -> None:
         LOG.info("Saved authenticated Playwright storage state: %s", storage_state)
 
 
-def authenticate(page: Any, config: Config) -> None:
+def authenticate(page: Any, config: dict[str, Any]) -> None:
     """Use a valid session first, then fall back to the homepage login flow."""
-    storage_state = str(config.browser.get("storage_state", "")).strip()
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
     if storage_state and Path(storage_state).exists():
         try:
             verify_imported_session(page, config)
@@ -739,21 +670,47 @@ def authenticate(page: Any, config: Config) -> None:
     login_from_homepage(page, config)
 
 
-def _new_context(browser: Any, config: Config):
+def _new_context(browser: Any, config: dict[str, Any], *, use_session: bool = True):
     """Create a context, ignoring a malformed optional session for fallback login."""
-    context_options = {"locale": "zh-TW", "timezone_id": config.schedule["timezone"]}
-    storage_state = str(config.browser.get("storage_state", "")).strip()
-    if storage_state and Path(storage_state).exists():
-        context_options["storage_state"] = storage_state
+    options = {"locale": "zh-TW", "timezone_id": config["schedule"]["timezone"]}
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
+    if use_session and storage_state and Path(storage_state).exists():
         try:
-            return browser.new_context(**context_options)
+            return browser.new_context(storage_state=storage_state, **options)
         except Exception as exc:
             LOG.warning("Could not load configured storage_state; attempting homepage login: %s", exc)
-            context_options.pop("storage_state", None)
-    return browser.new_context(**context_options)
+    return browser.new_context(**options)
 
 
-def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
+@contextmanager
+def chrome_page(config: dict[str, Any], *, use_session: bool = True):
+    """Launch the system Chrome, yield one page, and always close the browser."""
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError as exc:
+        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
+    launch_options: dict[str, Any] = {"headless": bool(config["browser"].get("headless", True))}
+    if config["browser"].get("executable_path"):
+        launch_options["executable_path"] = str(config["browser"]["executable_path"])
+    else:
+        launch_options["channel"] = str(config["browser"].get("channel", "chrome"))
+    with sync_playwright() as playwright:
+        browser = None
+        try:
+            browser = playwright.chromium.launch(**launch_options)
+            yield _new_context(browser, config, use_session=use_session).new_page()
+        except Exception as exc:
+            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
+                raise CannotConfirm(
+                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
+                ) from exc
+            raise
+        finally:
+            if browser is not None:
+                browser.close()
+
+
+def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> str:
     try:
         from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     except ImportError as exc:
@@ -764,9 +721,9 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     if "pending_bump" in state:
         LOG.info("Checking the previous unfinished bump before starting another")
         recovered = finish_pending_bump(page, config, state, collect_posts(page, config), now)
-    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
-    page.set_default_timeout(int(config.browser.get("navigation_timeout_ms", 30000)))
-    selector = str(config.selectors.get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
+    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    page.set_default_timeout(int(config["browser"].get("navigation_timeout_ms", 30000)))
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
         page.locator(selector).first.wait_for(state="attached")
     except PlaywrightTimeoutError as exc:
@@ -783,18 +740,18 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     posts = collect_posts(page, config)
     previous = deletion_candidates(posts, keep_latest_replies=0)
     target = previous[0] if previous else None
-    if not config.cleanup.get("enabled", False):
+    if not config["cleanup"].get("enabled", False):
         target = None
-    elif config.cleanup.get("dry_run", True):
+    elif config["cleanup"].get("dry_run", True):
         if target:
             LOG.info("Cleanup dry-run: would delete floor %s (sn=%s) after a successful bump", target.floor, target.sn)
         target = None
     state["pending_bump"] = {
-        "thread_url": str(config.thread["url"]),
+        "thread_url": str(config["thread"]["url"]),
         "before_sn": max(int(post.sn) for post in posts),
         "previous_reply": {"floor": target.floor, "sn": target.sn} if target else None,
     }
-    page.goto(str(config.thread["url"]), wait_until="domcontentloaded")
+    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
     page.locator(selector).first.wait_for(state="attached")
     _navigate_to_last_page(page, config)
     if is_today(latest_post_timestamp(page, config, now), now):
@@ -803,11 +760,11 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         write_state(path, state)
         return "recovered" if recovered else "already_done"
     write_state(path, state)
-    body = str(config.thread.get("content_template", "頂🆙！\n（{timestamp}）")).format(
+    body = str(config["thread"].get("content_template", "頂🆙！\n（{timestamp}）")).format(
         timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     )
-    editor_selector = str(config.selectors.get("editor", "#editor"))
-    submit_selector = str(config.selectors.get("post_submit", "[data-action='quick-post'], #quick-post, button[type='submit']"))
+    editor_selector = str(config["selectors"].get("editor", "#editor"))
+    submit_selector = str(config["selectors"].get("post_submit", "[data-action='quick-post'], #quick-post, button[type='submit']"))
     editor = _first_visible(page, editor_selector)
     submit = _first_visible(page, submit_selector)
     if not editor:
@@ -856,7 +813,7 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
         editor.fill(body)
         submit.click()
     try:
-        page.wait_for_load_state("domcontentloaded", timeout=int(config.browser.get("navigation_timeout_ms", 30000)))
+        page.wait_for_load_state("domcontentloaded", timeout=int(config["browser"].get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
         LOG.warning("Reply navigation timed out; checking from an independent page")
     verification_page = page.context.new_page()
@@ -869,147 +826,35 @@ def inspect_and_maybe_bump(page: Any, config: Config, now: datetime) -> str:
     return "posted"
 
 
-def run_once(config: Config) -> str:
+def run_once(config: dict[str, Any]) -> str:
     now = taiwan_now(config)
-    LOG.info("Checking %s at %s", config.thread["url"], now.isoformat())
-    try:
-        from playwright.sync_api import TimeoutError as PlaywrightTimeoutError, sync_playwright
-    except ImportError as exc:
-        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    with bump_lock(config), sync_playwright() as playwright:
-        storage_state = str(config.browser.get("storage_state", "")).strip()
-        launch_options = {
-            "headless": bool(config.browser.get("headless", True)),
-            "channel": str(config.browser.get("channel", "chrome")),
-        }
-        if config.browser.get("executable_path"):
-            launch_options.pop("channel")
-            launch_options["executable_path"] = str(config.browser["executable_path"])
-        browser = None
-        try:
-            browser = playwright.chromium.launch(**launch_options)
-            context = _new_context(browser, config)
-            page = context.new_page()
-            authenticate(page, config)
-            return inspect_and_maybe_bump(page, config, now)
-        except Exception as exc:
-            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
-                raise CannotConfirm(
-                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
-                ) from exc
-            raise
-        finally:
-            if browser is not None:
-                browser.close()
+    LOG.info("Checking %s at %s", config["thread"]["url"], now.isoformat())
+    with bump_lock(config), chrome_page(config) as page:
+        authenticate(page, config)
+        return inspect_and_maybe_bump(page, config, now)
 
 
-def run_cleanup(config: Config, max_deletions: int = 0) -> int:
+def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
     """Run the explicit cleanup command in the same authenticated Chrome session."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    with bump_lock(config), sync_playwright() as playwright:
-        storage_state = str(config.browser.get("storage_state", "")).strip()
-        launch_options = {
-            "headless": bool(config.browser.get("headless", True)),
-            "channel": str(config.browser.get("channel", "chrome")),
-        }
-        if config.browser.get("executable_path"):
-            launch_options.pop("channel")
-            launch_options["executable_path"] = str(config.browser["executable_path"])
-        browser = None
-        try:
-            browser = playwright.chromium.launch(**launch_options)
-            context = _new_context(browser, config)
-            page = context.new_page()
-            authenticate(page, config)
-            return cleanup_thread(page, config, max_deletions=max_deletions)
-        except Exception as exc:
-            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
-                raise CannotConfirm(
-                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
-                ) from exc
-            raise
-        finally:
-            if browser is not None:
-                browser.close()
+    with bump_lock(config), chrome_page(config) as page:
+        authenticate(page, config)
+        return cleanup_thread(page, config, max_deletions=max_deletions)
 
 
-def test_imported_session(config: Config) -> None:
+def test_imported_session(config: dict[str, Any]) -> None:
     """Open Chrome with the imported storage state and verify authentication only."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    storage_state = str(config.browser.get("storage_state", "")).strip()
-    if not storage_state or not Path(storage_state).exists():
-        raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
-    launch_options = {
-        "headless": bool(config.browser.get("headless", True)),
-        "channel": str(config.browser.get("channel", "chrome")),
-    }
-    if config.browser.get("executable_path"):
-        launch_options.pop("channel")
-        launch_options["executable_path"] = str(config.browser["executable_path"])
-    browser = None
-    with sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch(**launch_options)
-            context = browser.new_context(
-                locale="zh-TW",
-                timezone_id=config.schedule["timezone"],
-                storage_state=storage_state,
-            )
-            page = context.new_page()
-            verify_imported_session(page, config)
-        except Exception as exc:
-            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
-                raise CannotConfirm(
-                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
-                ) from exc
-            raise
-        finally:
-            if browser is not None:
-                browser.close()
+    with chrome_page(config) as page:
+        verify_imported_session(page, config)
 
 
-def test_automatic_login(config: Config) -> None:
+def test_automatic_login(config: dict[str, Any]) -> None:
     """Force a clean homepage login test without relying on an imported session."""
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError as exc:
-        raise CannotConfirm("The Playwright Python package is required; run pip install -r requirements.txt") from exc
-    launch_options = {
-        "headless": bool(config.browser.get("headless", True)),
-        "channel": str(config.browser.get("channel", "chrome")),
-    }
-    if config.browser.get("executable_path"):
-        launch_options.pop("channel")
-        launch_options["executable_path"] = str(config.browser["executable_path"])
-    browser = None
-    with sync_playwright() as playwright:
-        try:
-            browser = playwright.chromium.launch(**launch_options)
-            context = browser.new_context(
-                locale="zh-TW",
-                timezone_id=config.schedule["timezone"],
-            )
-            page = context.new_page()
-            login_from_homepage(page, config)
-        except Exception as exc:
-            if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
-                raise CannotConfirm(
-                    "Could not launch system Google Chrome; install google-chrome-stable or set [browser] executable_path"
-                ) from exc
-            raise
-        finally:
-            if browser is not None:
-                browser.close()
+    with chrome_page(config, use_session=False) as page:
+        login_from_homepage(page, config)
 
 
-def state_path(config: Config) -> Path:
-    return Path(str(config.schedule.get("state_file", "state.json")))
+def state_path(config: dict[str, Any]) -> Path:
+    return Path(str(config["schedule"].get("state_file", "state.json")))
 
 
 def read_state(path: Path) -> dict[str, Any]:
@@ -1035,7 +880,7 @@ def write_state(path: Path, state: dict[str, Any]) -> None:
 
 
 @contextmanager
-def bump_lock(config: Config):
+def bump_lock(config: dict[str, Any]):
     path = state_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Closing the fd releases the flock, so no explicit unlock is needed.
@@ -1047,8 +892,8 @@ def bump_lock(config: Config):
         yield
 
 
-def scheduled_datetime(now: datetime, config: Config) -> datetime:
-    hour, minute = map(int, str(config.schedule["time"]).split(":", 1))
+def scheduled_datetime(now: datetime, config: dict[str, Any]) -> datetime:
+    hour, minute = map(int, str(config["schedule"]["time"]).split(":", 1))
     return datetime.combine(now.date(), dt_time(hour, minute), tzinfo=now.tzinfo)
 
 
@@ -1058,8 +903,9 @@ TELEGRAM_ALLOWED_HOSTS = {"api.telegram.org"}
 def _open_telegram_url(url: str, *, timeout: int, data: bytes | None = None) -> Any:
     """Open a Telegram URL after verifying it targets an allowlisted host over HTTPS.
 
-    Requests only ever go to api.telegram.org; this guard rejects any URL whose
-    scheme or host was not the expected Telegram endpoint before it is fetched.
+    _replace_session builds its URL from a file_path returned by the Telegram
+    API, so the target is not fully under this process's control; reject any
+    scheme or host that is not the expected endpoint before fetching it.
     """
     parsed = urllib.parse.urlsplit(url)
     if parsed.scheme != "https" or parsed.hostname not in TELEGRAM_ALLOWED_HOSTS:
@@ -1068,7 +914,6 @@ def _open_telegram_url(url: str, *, timeout: int, data: bytes | None = None) -> 
     return urllib.request.urlopen(request, timeout=timeout)  # noqa: S310 - host allowlisted above
 
 
-NOTIFICATION_TYPES = {"success", "error", "auth", "layout", "system"}
 NOTIFICATION_LABELS = {
     "success": "成功通知",
     "error": "錯誤通知",
@@ -1076,7 +921,8 @@ NOTIFICATION_LABELS = {
     "layout": "排版通知",
     "system": "系統通知",
 }
-NOTIFICATION_ORDER = ("success", "error", "auth", "layout", "system")
+NOTIFICATION_TYPES = frozenset(NOTIFICATION_LABELS)
+NOTIFICATION_ORDER = tuple(NOTIFICATION_LABELS)
 
 
 class TelegramNotifier:
@@ -1092,12 +938,12 @@ class TelegramNotifier:
         {"command": "help", "description": "查看所有指令"},
     ]
 
-    def __init__(self, config: Config):
+    def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.token = str(config.telegram["bot_token"])
-        self.target_chat_id = str(config.telegram["target_chat_id"])
-        self.admin_chat_id = str(config.telegram["admin_chat_id"])
-        self.path = Path(str(config.telegram.get("state_file", "telegram_state.json")))
+        self.token = str(config["telegram"]["bot_token"])
+        self.target_chat_id = str(config["telegram"]["target_chat_id"])
+        self.admin_chat_id = str(config["telegram"]["admin_chat_id"])
+        self.path = Path(str(config["telegram"].get("state_file", "telegram_state.json")))
         saved = self._read_state()
         self.offset = int(saved.get("offset", 0))
         self.disabled = set(saved.get("disabled", [])) & NOTIFICATION_TYPES
@@ -1118,28 +964,20 @@ class TelegramNotifier:
             LOG.warning("Telegram command menu registration failed: %s", exc)
 
     def _read_state(self) -> dict[str, Any]:
+        # A corrupt Telegram state only costs the update offset; never fail the service for it.
         try:
             value = json.loads(self.path.read_text(encoding="utf-8"))
-            return value if isinstance(value, dict) else {}
-        except (FileNotFoundError, ValueError, TypeError, json.JSONDecodeError):
+        except (OSError, ValueError):
             return {}
+        return value if isinstance(value, dict) else {}
 
     def _write_state(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps(
-                {
-                    "offset": self.offset,
-                    "disabled": sorted(self.disabled),
-                    "awaiting_session": self.awaiting_session,
-                    "message_template": self.message_template,
-                },
-                ensure_ascii=False,
-            ),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        write_state(self.path, {
+            "offset": self.offset,
+            "disabled": sorted(self.disabled),
+            "awaiting_session": self.awaiting_session,
+            "message_template": self.message_template,
+        })
 
     def _api(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
         url = f"https://api.telegram.org/bot{self.token}/{method}"
@@ -1170,34 +1008,33 @@ class TelegramNotifier:
         except Exception as exc:
             LOG.warning("Telegram command reply failed: %s", exc)
 
-    def _notification_menu(self, action: str) -> None:
-        label = {"disable": "關閉", "enable": "開啟", "toggle": "切換"}.get(action, "切換")
-        buttons = self._notification_buttons(action)
+    def _notification_menu(self) -> None:
         try:
             self._api(
                 "sendMessage",
                 {
                     "chat_id": self.admin_chat_id,
-                    "text": f"請選擇要{label}的通知類型：",
-                    "reply_markup": json.dumps({"inline_keyboard": buttons}, ensure_ascii=False),
+                    "text": "請選擇要切換的通知類型：",
+                    "reply_markup": json.dumps({"inline_keyboard": self._notification_buttons()}, ensure_ascii=False),
                 },
             )
         except Exception as exc:
             LOG.warning("Telegram notification menu failed: %s", exc)
 
-    def _notification_buttons(self, action: str) -> list[list[dict[str, str]]]:
+    def _notification_buttons(self) -> list[list[dict[str, str]]]:
         """Build Chinese labels with current state shown by emoji."""
-        buttons = []
-        for kind in NOTIFICATION_ORDER:
-            status = "✅" if kind not in self.disabled else "❌"
-            buttons.append([{"text": f"{status} {NOTIFICATION_LABELS[kind]}", "callback_data": f"notify:{action}:{kind}"}])
+        buttons = [
+            [{"text": f"{'✅' if kind not in self.disabled else '❌'} {NOTIFICATION_LABELS[kind]}",
+              "callback_data": f"notify:{kind}"}]
+            for kind in NOTIFICATION_ORDER
+        ]
         buttons.append([{
             "text": f"{'✅' if not self.disabled else '❌'} 全部通知",
-            "callback_data": f"notify:{action}:all",
+            "callback_data": "notify:all",
         }])
         return buttons
 
-    def _refresh_notification_menu(self, message: dict[str, Any], action: str) -> None:
+    def _refresh_notification_menu(self, message: dict[str, Any]) -> None:
         message_id = message.get("message_id")
         if not message_id:
             return
@@ -1206,10 +1043,24 @@ class TelegramNotifier:
             self._api("editMessageReplyMarkup", {
                 "chat_id": str(chat.get("id", self.admin_chat_id)),
                 "message_id": str(message_id),
-                "reply_markup": json.dumps({"inline_keyboard": self._notification_buttons(action)}, ensure_ascii=False),
+                "reply_markup": json.dumps({"inline_keyboard": self._notification_buttons()}, ensure_ascii=False),
             })
         except Exception as exc:
             LOG.warning("Telegram notification menu refresh failed: %s", exc)
+
+    def _toggle(self, kind: str) -> str:
+        """Flip one notification type (or every type at once) and persist it."""
+        if kind == "all":
+            self.disabled = set() if self.disabled else set(NOTIFICATION_TYPES)
+            reply = "已切換全部通知。"
+        elif kind in self.disabled:
+            self.disabled.remove(kind)
+            reply = f"已開啟通知類型：{NOTIFICATION_LABELS[kind]}。"
+        else:
+            self.disabled.add(kind)
+            reply = f"已關閉通知類型：{NOTIFICATION_LABELS[kind]}。"
+        self._write_state()
+        return reply
 
     def _handle_callback(self, callback: dict[str, Any]) -> None:
         message = callback.get("message") or {}
@@ -1217,31 +1068,11 @@ class TelegramNotifier:
         callback_id = str(callback.get("id", ""))
         if str(chat.get("id")) != self.admin_chat_id:
             return
-        data = str(callback.get("data", ""))
-        parts = data.split(":")
-        if len(parts) != 3 or parts[0] != "notify" or parts[1] not in {"toggle", "enable", "disable"}:
+        prefix, _, kind = str(callback.get("data", "")).partition(":")
+        if prefix != "notify" or (kind not in NOTIFICATION_TYPES and kind != "all"):
             return
-        action, kind = parts[1], parts[2]
-        if kind not in NOTIFICATION_TYPES and kind != "all":
-            return
-        if action == "toggle":
-            if kind == "all":
-                self.disabled = set() if self.disabled else set(NOTIFICATION_TYPES)
-                reply = "已切換全部通知。"
-            elif kind in self.disabled:
-                self.disabled.remove(kind)
-                reply = f"已開啟通知類型：{NOTIFICATION_LABELS[kind]}。"
-            else:
-                self.disabled.add(kind)
-                reply = f"已關閉通知類型：{NOTIFICATION_LABELS[kind]}。"
-        elif action == "disable":
-            self.disabled = set(NOTIFICATION_TYPES) if kind == "all" else self.disabled | {kind}
-            reply = f"已關閉通知類型：{NOTIFICATION_LABELS.get(kind, '全部通知') if kind != 'all' else '全部通知'}。"
-        else:
-            self.disabled = set() if kind == "all" else self.disabled - {kind}
-            reply = f"已開啟通知類型：{NOTIFICATION_LABELS.get(kind, '全部通知') if kind != 'all' else '全部通知'}。"
-        self._write_state()
-        self._refresh_notification_menu(message, action)
+        reply = self._toggle(kind)
+        self._refresh_notification_menu(message)
         try:
             if callback_id:
                 self._api("answerCallbackQuery", {"callback_query_id": callback_id, "text": reply})
@@ -1250,14 +1081,15 @@ class TelegramNotifier:
         self._command_reply(reply)
 
     def _replace_session(self, file_id: str) -> None:
-        storage_state = str(self.config.browser.get("storage_state", "")).strip()
+        storage_state = str(self.config["browser"].get("storage_state", "")).strip()
         if not storage_state:
             raise ConfigError("browser.storage_state is required for Telegram session upload")
         file_info = self._api("getFile", {"file_id": file_id})
         file_path = str((file_info.get("result") or {}).get("file_path", ""))
         if not file_path:
             raise RuntimeError("Telegram did not return a session file path")
-        url = f"https://api.telegram.org/file/bot{self.token}/{file_path}"
+        # file_path is remote input; quote it so it cannot add a query or fragment.
+        url = f"https://api.telegram.org/file/bot{self.token}/{urllib.parse.quote(file_path, safe='/')}"
         with _open_telegram_url(url, timeout=30) as response:
             raw = response.read(5 * 1024 * 1024 + 1)
         if len(raw) > 5 * 1024 * 1024:
@@ -1293,15 +1125,15 @@ class TelegramNotifier:
             self.message_template = value
         self._write_state()
 
-    def configured(self, config: Config) -> Config:
+    def configured(self, config: dict[str, Any]) -> dict[str, Any]:
         """Return config with a Telegram-managed message override, if present."""
         if not self.message_template:
             return config
-        thread = dict(config.thread)
+        thread = dict(config["thread"])
         thread["content_template"] = self.message_template
-        values = dict(config.values)
+        values = dict(config)
         values["thread"] = thread
-        return Config(values)
+        return values
 
     def poll_commands(self) -> None:
         try:
@@ -1337,19 +1169,9 @@ class TelegramNotifier:
                     self._command_reply(f"session 替換失敗：{exc}")
                 continue
             if name == "/toggle" and (arg in NOTIFICATION_TYPES or arg == "all"):
-                if arg == "all":
-                    self.disabled = set() if self.disabled else set(NOTIFICATION_TYPES)
-                    reply = "已切換全部通知。"
-                elif arg in self.disabled:
-                    self.disabled.remove(arg)
-                    reply = f"已開啟通知類型：{NOTIFICATION_LABELS[arg]}。"
-                else:
-                    self.disabled.add(arg)
-                    reply = f"已關閉通知類型：{NOTIFICATION_LABELS[arg]}。"
-                self._write_state()
-                self._command_reply(reply)
+                self._command_reply(self._toggle(arg))
             elif name == "/toggle":
-                self._notification_menu("toggle")
+                self._notification_menu()
             elif name == "/status":
                 enabled = sorted(NOTIFICATION_TYPES - self.disabled)
                 message_status = "自訂" if self.message_template else "設定檔預設"
@@ -1398,7 +1220,7 @@ def notification_kind(exc: Exception) -> str:
 
 
 def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
-    poll_interval = max(1, int(notifier.config.telegram.get("poll_interval_seconds", 2)))
+    poll_interval = max(1, int(notifier.config["telegram"].get("poll_interval_seconds", 2)))
     deadline = time.monotonic() + seconds
     while True:
         notifier.poll_commands()
@@ -1408,8 +1230,8 @@ def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
         time.sleep(min(poll_interval, remaining))
 
 
-def run_loop(config: Config) -> None:
-    retry = int(config.schedule["retry_interval_seconds"])
+def run_loop(config: dict[str, Any]) -> None:
+    retry = int(config["schedule"]["retry_interval_seconds"])
     path = state_path(config)
     notifier = TelegramNotifier(config)
     while True:
@@ -1430,10 +1252,10 @@ def run_loop(config: Config) -> None:
             result = run_once(notifier.configured(config))
             if result in {"posted", "recovered"}:
                 message = "巴哈姆特頂文成功" if result == "posted" else "巴哈姆特上次頂文與清理已補完"
-                notifier.send("success", f"{message}\n文章：{config.thread['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
+                notifier.send("success", f"{message}\n文章：{config['thread']['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
         except Exception as exc:
             LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, retry)
-            notifier.send(notification_kind(exc), f"巴哈姆特自動頂文發生問題\n文章：{config.thread['url']}\n類型：{notification_kind(exc)}\n原因：{exc}")
+            notifier.send(notification_kind(exc), f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{notification_kind(exc)}\n原因：{exc}")
             sleep_with_telegram(retry, notifier)
 
 
@@ -1446,13 +1268,14 @@ def main() -> int:
     parser.add_argument("--cleanup-limit", type=int, default=0, help="maximum replies to delete during --cleanup (0 = all)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    notifier = None
     try:
         config = load_config(args.config)
         if args.cleanup:
-            cleanup_values = dict(config.values.get("cleanup", {}))
+            cleanup_values = dict(config["cleanup"])
             if args.apply:
                 cleanup_values["dry_run"] = False
-            cleanup_config = Config({**config.values, "cleanup": cleanup_values})
+            cleanup_config = {**config, "cleanup": cleanup_values}
             deleted = run_cleanup(cleanup_config, max_deletions=max(0, args.cleanup_limit))
             LOG.info("Cleanup finished; deleted %s post(s)", deleted)
             return 0
@@ -1460,20 +1283,20 @@ def main() -> int:
         if args.once:
             result = run_once(notifier.configured(config))
             if result == "posted":
-                notifier.send("success", f"巴哈姆特頂文成功\n文章：{config.thread['url']}")
+                notifier.send("success", f"巴哈姆特頂文成功\n文章：{config['thread']['url']}")
             elif result == "recovered":
-                notifier.send("success", f"巴哈姆特上次頂文與清理已補完\n文章：{config.thread['url']}")
+                notifier.send("success", f"巴哈姆特上次頂文與清理已補完\n文章：{config['thread']['url']}")
         else:
             run_loop(config)
         return 0
     except (ConfigError, CannotConfirm) as exc:
         LOG.error("%s", exc)
-        if 'notifier' in locals():
+        if notifier is not None:
             notifier.send(notification_kind(exc), f"巴哈姆特自動頂文發生問題\n原因：{exc}")
         return 2
     except Exception:
         LOG.exception("Unexpected failure; no bump was attempted unless submission was already verified")
-        if 'notifier' in locals():
+        if notifier is not None:
             notifier.send("system", "巴哈姆特自動頂文發生未預期錯誤，請查看服務日誌。")
         return 2
 

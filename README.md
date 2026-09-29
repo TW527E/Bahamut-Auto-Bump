@@ -54,6 +54,8 @@ cp config.example.toml config.toml
 chmod 600 config.toml
 ```
 
+只有在 `[account] totp_secret` 要填入 TOTP 兩步驗證秘密時，才需要額外安裝 `pip install "pyotp>=2.9,<3"`。
+
 編輯 `config.toml` 的文章網址、每天執行時間、可選的 `browser.storage_state` 路徑與 `[account]` 帳號資料，以及 Telegram Bot 的 `bot_token`、目標頻道 `target_chat_id` 和可控制通知的管理者 `admin_chat_id`。先把 Bot 加入目標頻道並授予發文權限；頻道 ID 通常是 `-100...`。管理者先對 Bot 傳訊息，再從 Telegram 的更新資料或 `getUpdates` 取得自己的數字 chat id。若巴哈姆特改版，先用瀏覽器開發者工具確認 `[selectors]` 中的選擇器，再用 `--once` 測試。
 
 ```sh

@@ -6,7 +6,6 @@ from zoneinfo import ZoneInfo
 
 from bahamut_auto_bump import (
     CannotConfirm,
-    Config,
     NOTIFICATION_LABELS,
     NOTIFICATION_ORDER,
     PostInfo,
@@ -14,6 +13,7 @@ from bahamut_auto_bump import (
     _account_credentials,
     deletion_candidates,
     finish_pending_bump,
+    load_config,
     parse_post_time,
     read_state,
     write_state,
@@ -49,40 +49,75 @@ class TimestampTests(unittest.TestCase):
 
 class AuthenticationConfigTests(unittest.TestCase):
     def test_account_credentials_are_required_for_fallback_login(self):
-        config = Config({"account": {}, "browser": {}, "selectors": {}})
+        config = {"account": {}, "browser": {}, "selectors": {}}
         with self.assertRaises(CannotConfirm):
             _account_credentials(config)
 
     def test_account_credentials_allow_optional_totp(self):
-        config = Config({
+        config = {
             "account": {"username": "user", "password": "pass", "totp_secret": " ABC123 "},
             "browser": {},
             "selectors": {},
-        })
+        }
         self.assertEqual(_account_credentials(config), ("user", "pass", "ABC123"))
+
+
+class ConfigLoadingTests(unittest.TestCase):
+    MINIMAL = """
+[thread]
+url = "https://forum.gamer.com.tw/C.php?bsn=1&snA=2"
+[selectors]
+[browser]
+[schedule]
+timezone = "Asia/Taipei"
+time = "09:00"
+retry_interval_seconds = 900
+[telegram]
+bot_token = "t"
+target_chat_id = "-100"
+admin_chat_id = "1"
+"""
+
+    def _load(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "config.toml"
+            path.write_text(text, encoding="utf-8")
+            return load_config(path)
+
+    def test_optional_cleanup_section_always_present(self):
+        # Every config["cleanup"] read depends on load_config supplying the default.
+        self.assertEqual(self._load(self.MINIMAL)["cleanup"], {})
+
+    def test_explicit_cleanup_section_is_preserved(self):
+        config = self._load(self.MINIMAL + '\n[cleanup]\nenabled = true\n')
+        self.assertEqual(config["cleanup"], {"enabled": True})
+
+    def test_short_retry_interval_is_rejected(self):
+        with self.assertRaises(Exception):
+            self._load(self.MINIMAL.replace("retry_interval_seconds = 900", "retry_interval_seconds = 5"))
 
 
 class CleanupTests(unittest.TestCase):
     def test_floor_one_and_newest_reply_are_retained(self):
         posts = [
-            PostInfo(1, "root", True, "2026-01-01 00:00:00", "root"),
-            PostInfo(2, "old", True, "2026-01-02 00:00:00", "頂"),
-            PostInfo(3, "previous", True, "2026-01-03 00:00:00", "頂"),
-            PostInfo(4, "latest", True, "2026-01-04 00:00:00", "頂"),
-            PostInfo(5, "other-user", False, "2026-01-05 00:00:00", "頂"),
+            PostInfo(1, "root", True, "2026-01-01 00:00:00"),
+            PostInfo(2, "old", True, "2026-01-02 00:00:00"),
+            PostInfo(3, "previous", True, "2026-01-03 00:00:00"),
+            PostInfo(4, "latest", True, "2026-01-04 00:00:00"),
+            PostInfo(5, "other-user", False, "2026-01-05 00:00:00"),
         ]
         self.assertEqual([post.sn for post in deletion_candidates(posts, 1)], ["previous", "old"])
 
     def test_keep_two_replies(self):
-        posts = [PostInfo(floor, str(floor), True, "2026-01-01 00:00:00", "頂") for floor in range(1, 6)]
+        posts = [PostInfo(floor, str(floor), True, "2026-01-01 00:00:00") for floor in range(1, 6)]
         self.assertEqual([post.floor for post in deletion_candidates(posts, 2)], [3, 2])
 
     def test_latest_is_selected_by_post_number_not_page_floor(self):
         posts = [
-            PostInfo(1, "100", True, "2026-01-01 00:00:00", "root"),
-            PostInfo(8, "800", True, "2026-01-02 00:00:00", "old page tail"),
-            PostInfo(140, "1400", True, "2026-01-03 00:00:00", "old page tail"),
-            PostInfo(2, "1500", True, "2026-01-04 00:00:00", "newest reply"),
+            PostInfo(1, "100", True, "2026-01-01 00:00:00"),
+            PostInfo(8, "800", True, "2026-01-02 00:00:00"),
+            PostInfo(140, "1400", True, "2026-01-03 00:00:00"),
+            PostInfo(2, "1500", True, "2026-01-04 00:00:00"),
         ]
         self.assertEqual([post.sn for post in deletion_candidates(posts, 1)], ["1400", "800"])
 
@@ -98,7 +133,7 @@ class NotificationMenuTests(unittest.TestCase):
     def test_buttons_show_chinese_labels_and_current_emoji_state(self):
         notifier = TelegramNotifier.__new__(TelegramNotifier)
         notifier.disabled = {"error", "system"}
-        buttons = notifier._notification_buttons("toggle")
+        buttons = notifier._notification_buttons()
         labels = [row[0]["text"] for row in buttons]
         self.assertEqual(labels[:5], [
             f"✅ {NOTIFICATION_LABELS['success']}",
@@ -108,7 +143,22 @@ class NotificationMenuTests(unittest.TestCase):
             f"❌ {NOTIFICATION_LABELS['system']}",
         ])
         self.assertEqual(labels[5], "❌ 全部通知")
-        self.assertEqual(tuple(NOTIFICATION_LABELS), NOTIFICATION_ORDER)
+
+    def test_callback_data_round_trips_through_toggle(self):
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.disabled = set()
+        notifier._write_state = lambda: None
+        payloads = [row[0]["callback_data"] for row in notifier._notification_buttons()]
+        self.assertEqual(payloads, [f"notify:{kind}" for kind in NOTIFICATION_ORDER] + ["notify:all"])
+        for payload in payloads:
+            kind = payload.split(":", 1)[1]
+            self.assertTrue(kind == "all" or kind in NOTIFICATION_LABELS)
+        notifier._toggle("error")
+        self.assertEqual(notifier.disabled, {"error"})
+        notifier._toggle("error")
+        self.assertEqual(notifier.disabled, set())
+        notifier._toggle("all")
+        self.assertEqual(notifier.disabled, set(NOTIFICATION_ORDER))
 
     def test_send_prefixes_success_and_error_notifications(self):
         notifier = TelegramNotifier.__new__(TelegramNotifier)
@@ -140,14 +190,14 @@ class PendingBumpTests(unittest.TestCase):
         self.url = "https://forum.gamer.com.tw/C.php?bsn=1&snA=2"
 
     def _config(self, **cleanup):
-        return Config({
+        return {
             "thread": {"url": self.url},
             "selectors": {},
             "browser": {},
             "schedule": {"timezone": "Asia/Taipei", "state_file": "state.json"},
             "telegram": {},
             "cleanup": cleanup,
-        })
+        }
 
     def _run(self, state, posts, config, page=None, delete=None, verify=None):
         import bahamut_auto_bump as mod
@@ -167,14 +217,14 @@ class PendingBumpTests(unittest.TestCase):
 
     def test_missing_new_reply_leaves_pending(self):
         state = {"pending_bump": {"thread_url": self.url, "before_sn": 100, "previous_reply": None}}
-        posts = [PostInfo(1, "50", True, "2026-01-01 00:00:00", "root")]
+        posts = [PostInfo(1, "50", True, "2026-01-01 00:00:00")]
         done, page, state = self._run(state, posts, self._config())
         self.assertFalse(done)
         self.assertIn("pending_bump", state)
 
     def test_confirms_new_reply_without_cleanup(self):
         state = {"pending_bump": {"thread_url": self.url, "before_sn": 100, "previous_reply": None}}
-        posts = [PostInfo(2, "150", True, "2026-01-05 09:00:00", "頂")]
+        posts = [PostInfo(2, "150", True, "2026-01-05 09:00:00")]
         done, page, state = self._run(state, posts, self._config())
         self.assertTrue(done)
         self.assertEqual(state["last_confirmed_date"], "2026-01-05")
@@ -187,8 +237,8 @@ class PendingBumpTests(unittest.TestCase):
             "previous_reply": {"floor": 2, "sn": "80"},
         }}
         posts = [
-            PostInfo(2, "80", True, "2026-01-04 09:00:00", "頂"),
-            PostInfo(3, "150", True, "2026-01-05 09:00:00", "頂"),
+            PostInfo(2, "80", True, "2026-01-04 09:00:00"),
+            PostInfo(3, "150", True, "2026-01-05 09:00:00"),
         ]
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
         self.assertTrue(done)
@@ -200,7 +250,7 @@ class PendingBumpTests(unittest.TestCase):
             "thread_url": self.url, "before_sn": 100, "posted_sn": "150", "posted_date": "2026-01-05",
             "previous_reply": {"floor": 2, "sn": "80"},
         }}
-        posts = [PostInfo(3, "150", True, "2026-01-05 09:00:00", "頂")]
+        posts = [PostInfo(3, "150", True, "2026-01-05 09:00:00")]
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
         self.assertTrue(done)
         self.assertEqual(page.deleted, [])
@@ -213,8 +263,8 @@ class PendingBumpTests(unittest.TestCase):
             "previous_reply": {"floor": 2, "sn": "80"},
         }}
         posts = [
-            PostInfo(2, "90", True, "2026-01-04 09:00:00", "頂"),
-            PostInfo(3, "150", True, "2026-01-05 09:00:00", "頂"),
+            PostInfo(2, "90", True, "2026-01-04 09:00:00"),
+            PostInfo(3, "150", True, "2026-01-05 09:00:00"),
         ]
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
         self.assertTrue(done)
