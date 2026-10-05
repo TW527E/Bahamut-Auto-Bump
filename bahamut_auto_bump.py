@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger("bahamut-auto-bump")
 DEFAULT_CONFIG = Path("config.toml")
+DEFAULT_TEMPLATE = "頂🆙！\n（{timestamp}）"
 
 
 class ConfigError(ValueError):
@@ -38,6 +39,14 @@ class PostInfo:
     sn: str
     owner: bool
     raw_time: str
+    bump: bool = False
+
+
+def is_bump_text(text: str, template: str) -> bool:
+    """Match a rendered post body against content_template, ignoring whitespace."""
+    parts = ["".join(part.split()) for part in template.split("{timestamp}")]
+    pattern = r"\d{4}-\d{2}-\d{2}\d{2}:\d{2}:\d{2}UTC\+8".join(map(re.escape, parts))
+    return re.fullmatch(pattern, "".join(text.split())) is not None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -167,7 +176,9 @@ def _thread_page_urls(page: Any, config: dict[str, Any]) -> list[str]:
         )
     except Exception as exc:
         raise CannotConfirm(f"Could not inspect thread pagination: {exc}") from exc
-    pages = {1}
+    # Bahamut's pagination does not link the page being viewed, so a scan
+    # started from the last page would otherwise silently skip that page.
+    pages = {1, int(current_query.get("page", ["1"])[0])}
     for href in hrefs:
         parsed = urllib.parse.urlparse(str(href))
         query = urllib.parse.parse_qs(parsed.query)
@@ -192,6 +203,8 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config["selectors"].get("post_time_selector", ".edittime"))
+    content_selector = str(config["selectors"].get("post_content_selector", ".c-article__content"))
+    template = str(config["thread"].get("content_template", DEFAULT_TEMPLATE))
     page.set_default_timeout(timeout)
     try:
         configured = urllib.parse.urlparse(str(config["thread"]["url"]))
@@ -240,7 +253,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
             posts_locator.first.wait_for(state="attached", timeout=timeout)
             rows = page.locator("section[id^='post_']").evaluate_all(
                 """
-                (sections, timeSelector) => sections.map((section) => {
+                (sections, {timeSelector, contentSelector}) => sections.map((section) => {
                   const floorLink = Array.from(section.querySelectorAll('a')).find(a => /\\d+\\s*樓/.test((a.textContent || '').trim()));
                   // The section also contains data-tippy attributes for GP/BP
                   // counters; only the option-menu metadata includes owner.
@@ -252,11 +265,12 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
                     floor: (floorLink?.textContent || '').match(/(\\d+)\\s*樓/)?.[1] || '',
                     sn: String(meta.sn || section.id.replace(/^post_/, '')),
                     owner: meta.owner === true,
-                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || ''
+                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || '',
+                    text: section.querySelector(contentSelector)?.innerText || ''
                   };
                 }).filter(item => item.sn)
                 """,
-                time_selector,
+                {"timeSelector": time_selector, "contentSelector": content_selector},
             )
         except CannotConfirm:
             raise
@@ -278,14 +292,19 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
                 raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
             if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
                 raise CannotConfirm("Could not determine a valid post number")
-            result.append(PostInfo(floor, str(row["sn"]), bool(row["owner"]), str(row["raw"])))
+            result.append(PostInfo(
+                floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), is_bump_text(str(row["text"]), template),
+            ))
     if not result:
         raise CannotConfirm("No posts were found for cleanup")
     return sorted({post.sn: post for post in result}.values(), key=lambda post: post.floor)
 
 
 def deletion_candidates(posts: list[PostInfo], keep_latest_replies: int = 1) -> list[PostInfo]:
-    """Choose owned replies older than the retained newest replies; floor 1 is immutable.
+    """Choose owned bump replies older than the retained newest bumps; floor 1 is immutable.
+
+    Only replies matching content_template are considered, so the owner's
+    other replies in the thread are never deleted.
 
     Bahamut may leave non-contiguous/reused-looking floor labels after deletes.
     The post number (sn) is monotonic across the whole thread, so it is the
@@ -300,7 +319,7 @@ def deletion_candidates(posts: list[PostInfo], keep_latest_replies: int = 1) -> 
             sn = -1
         return sn, post.floor
 
-    replies = sorted((post for post in posts if post.floor > 1 and post.owner), key=order_key, reverse=True)
+    replies = sorted((post for post in posts if post.floor > 1 and post.owner and post.bump), key=order_key, reverse=True)
     return replies[keep:]
 
 
@@ -380,21 +399,6 @@ def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> No
         raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
 
 
-def cleanup_previous_reply(page: Any, config: dict[str, Any], target: PostInfo, posts: list[PostInfo]) -> None:
-    current = next((post for post in posts if post.sn == target.sn), None)
-    if current is not None:
-        if current not in deletion_candidates(posts, keep_latest_replies=1):
-            raise CannotConfirm(f"Pending cleanup post {target.sn} is no longer an older owned reply")
-        if not config["cleanup"].get("enabled", False) or config["cleanup"].get("dry_run", True):
-            raise CannotConfirm("Pending cleanup is paused while cleanup is disabled or dry-run")
-        delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
-        LOG.info("Waiting %s seconds before deleting previous bump sn=%s", delay, target.sn)
-        time.sleep(delay)
-        delete_post(page, config, current)
-    verify_post_deleted(page, config, target)
-    LOG.info("Confirmed previous bump is deleted (sn=%s)", target.sn)
-
-
 def finish_pending_bump(
     page: Any, config: dict[str, Any], state: dict[str, Any], posts: list[PostInfo], now: datetime,
 ) -> bool:
@@ -405,17 +409,6 @@ def finish_pending_bump(
         before_sn = pending["before_sn"]
         if type(before_sn) is not int or before_sn <= 0:
             raise ValueError("Invalid pre-bump post number")
-        target = pending["previous_reply"]
-        if target is not None:
-            if (
-                not isinstance(target, dict)
-                or type(target["floor"]) is not int
-                or target["floor"] <= 1
-                or not isinstance(target["sn"], str)
-                or not re.fullmatch(r"[0-9]+", target["sn"])
-                or not 0 < int(target["sn"]) <= before_sn
-            ):
-                raise ValueError("Invalid pending cleanup target")
         if "posted_sn" in pending and date.fromisoformat(pending["posted_date"]) > now.date():
             raise ValueError("Confirmed bump date is in the future")
     except (KeyError, TypeError, ValueError) as exc:
@@ -434,24 +427,40 @@ def finish_pending_bump(
         write_state(state_path(config), state)
         LOG.info("Confirmed submitted bump sn=%s at %s", posted.sn, posted_at.isoformat())
 
-    if target is not None:
-        cleanup_previous_reply(
-            page, config, PostInfo(target["floor"], target["sn"], True, ""), posts,
-        )
+    # Clean every older bump, not just the previous one, so a missed day is
+    # caught up on the next bump instead of being left behind forever.
+    unrecognized = None
+    if config["cleanup"].get("enabled", False):
+        posted = next((post for post in posts if post.sn == pending["posted_sn"]), None)
+        if posted is not None and not posted.bump:
+            unrecognized = posted.sn
+        else:
+            delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
+            LOG.info("Waiting %s seconds before cleaning up older bumps", delay)
+            time.sleep(delay)
+            cleanup_thread(page, config, posts)
     state["last_confirmed_date"] = pending["posted_date"]
     del state["pending_bump"]
     write_state(state_path(config), state)
+    if unrecognized:
+        # The bump itself succeeded; fail loudly so a markup change cannot
+        # silently stop cleanup again.
+        raise CannotConfirm(
+            f"Bump sn={unrecognized} does not match content_template; older bumps were not cleaned up "
+            "(check selectors.post_content_selector)"
+        )
     return True
 
 
-def cleanup_thread(page: Any, config: dict[str, Any], max_deletions: int = 0) -> int:
-    posts = collect_posts(page, config)
-    keep = int(config["cleanup"].get("keep_latest_replies", 1))
+def cleanup_thread(page: Any, config: dict[str, Any], posts: list[PostInfo], max_deletions: int = 0) -> int:
+    # Keeping at least one bump stops cleanup from deleting today's bump and
+    # triggering a re-bump on the next check.
+    keep = max(1, int(config["cleanup"].get("keep_latest_replies", 1)))
     candidates = deletion_candidates(posts, keep_latest_replies=keep)
     if max_deletions > 0:
         candidates = candidates[:max_deletions]
     if not candidates:
-        LOG.info("No cleanup candidates; floor 1 and the newest %s owned replies are retained", keep)
+        LOG.info("No cleanup candidates; floor 1 and the newest %s bump(s) are retained", keep)
         return 0
     dry_run = bool(config["cleanup"].get("dry_run", True))
     interval = max(5, int(config["cleanup"].get("interval_seconds", 5)))
@@ -735,21 +744,15 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         state.pop("pending_bump", None)
         state["last_confirmed_date"] = now.date().isoformat()
         write_state(path, state)
+        if not recovered and config["cleanup"].get("enabled", False):
+            # A dropped pending bump skipped its cleanup; catch up here.
+            cleanup_thread(page, config, collect_posts(page, config))
         return "recovered" if recovered else "already_done"
 
     posts = collect_posts(page, config)
-    previous = deletion_candidates(posts, keep_latest_replies=0)
-    target = previous[0] if previous else None
-    if not config["cleanup"].get("enabled", False):
-        target = None
-    elif config["cleanup"].get("dry_run", True):
-        if target:
-            LOG.info("Cleanup dry-run: would delete floor %s (sn=%s) after a successful bump", target.floor, target.sn)
-        target = None
     state["pending_bump"] = {
         "thread_url": str(config["thread"]["url"]),
         "before_sn": max(int(post.sn) for post in posts),
-        "previous_reply": {"floor": target.floor, "sn": target.sn} if target else None,
     }
     page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
     page.locator(selector).first.wait_for(state="attached")
@@ -760,7 +763,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         write_state(path, state)
         return "recovered" if recovered else "already_done"
     write_state(path, state)
-    body = str(config["thread"].get("content_template", "頂🆙！\n（{timestamp}）")).format(
+    body = str(config["thread"].get("content_template", DEFAULT_TEMPLATE)).format(
         timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     )
     editor_selector = str(config["selectors"].get("editor", "#editor"))
@@ -838,7 +841,7 @@ def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
     """Run the explicit cleanup command in the same authenticated Chrome session."""
     with bump_lock(config), chrome_page(config) as page:
         authenticate(page, config)
-        return cleanup_thread(page, config, max_deletions=max_deletions)
+        return cleanup_thread(page, config, collect_posts(page, config), max_deletions=max_deletions)
 
 
 def test_imported_session(config: dict[str, Any]) -> None:
