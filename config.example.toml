@@ -15,6 +15,8 @@ login_onboarding = "#driver-popover-content"
 login_onboarding_close = "#driver-popover-content button[aria-label='Close'], #driver-popover-content .driver-popover-close-btn, #driver-popover-content button"
 post_selector = "#BH-master > section[id^='post_'] .c-post"
 post_time_selector = ".edittime"
+# Body of each post; cleanup only deletes replies whose body matches content_template.
+post_content_selector = ".c-article__content"
 editor = "#editor"
 post_submit = "[data-action='quick-post'], #quick-post, button[type='submit']"
 
@@ -47,8 +49,8 @@ retry_interval_seconds = 900
 state_file = "state.json"
 
 [cleanup]
-# Keep floor 1 forever. Set enabled=true to remove the previous bump after a
-# newly submitted bump has been verified. Live deletion requires dry_run=false
+# Keep floor 1 forever. Set enabled=true to remove every older bump (replies
+# matching content_template) after a newly submitted bump has been verified. Live deletion requires dry_run=false
 # (or the explicit --apply flag for --cleanup).
 enabled = false
 dry_run = true
