@@ -9,6 +9,7 @@ from bahamut_auto_bump import (
     NOTIFICATION_LABELS,
     NOTIFICATION_ORDER,
     PostInfo,
+    RateLimited,
     TelegramNotifier,
     _account_credentials,
     deletion_candidates,
@@ -282,6 +283,117 @@ class PendingBumpTests(unittest.TestCase):
         }}
         with self.assertRaises(CannotConfirm):
             self._run(state, [], self._config(enabled=True, dry_run=False))
+
+
+class FakeResponse:
+    def __init__(self, status):
+        self.status = status
+
+
+class RateLimitedPage:
+    """Returns HTTP 429 for the first `limited` navigations, then 200."""
+
+    def __init__(self, limited, title="巴哈姆特"):
+        self.limited = limited
+        self.visits = []
+        self._title = title
+        self.url = ""
+
+    def goto(self, url, wait_until=None):
+        self.visits.append(url)
+        self.url = url
+        if len(self.visits) <= self.limited:
+            return FakeResponse(429)
+        return FakeResponse(200)
+
+    def title(self):
+        return "巴哈姆特電玩資訊站 -- 系統維修中" if len(self.visits) <= self.limited else self._title
+
+
+class RateLimitTests(unittest.TestCase):
+    def _goto(self, page, retries=3):
+        import bahamut_auto_bump as mod
+        sleeps = []
+        saved = mod.time.sleep
+        mod.time.sleep = sleeps.append
+        mod._last_navigation = 0.0
+        config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_wait_seconds": 10, "rate_limit_retries": retries}}
+        try:
+            mod._goto(page, "https://forum.gamer.com.tw/C.php?bsn=1&snA=2", config)
+        finally:
+            mod.time.sleep = saved
+        return sleeps
+
+    def test_waits_out_rate_limit_then_succeeds(self):
+        page = RateLimitedPage(limited=2)
+        sleeps = self._goto(page)
+        self.assertEqual(len(page.visits), 3)
+        self.assertEqual(sleeps, [10, 20])
+
+    def test_persistent_rate_limit_fails_closed(self):
+        page = RateLimitedPage(limited=10)
+        with self.assertRaises(CannotConfirm) as ctx:
+            self._goto(page, retries=2)
+        self.assertEqual(len(page.visits), 3)
+        self.assertIn("429", str(ctx.exception))
+        self.assertIsInstance(ctx.exception, RateLimited)
+        self.assertNotIn("snA", str(ctx.exception))
+
+    def test_no_wait_without_rate_limit(self):
+        page = RateLimitedPage(limited=0)
+        self.assertEqual(self._goto(page), [])
+
+
+class FakeLink:
+    def __init__(self, href):
+        self.href = href
+
+    def count(self):
+        return 1
+
+    def is_visible(self):
+        return True
+
+    def evaluate(self, script):
+        return self.href
+
+
+class CoverPage(RateLimitedPage):
+    def __init__(self, href):
+        super().__init__(limited=0)
+        self.href = href
+
+    def locator(self, selector):
+        page = self
+
+        class Locator:
+            @property
+            def first(self):
+                return FakeLink(page.href) if ".sky" in selector else type("Missing", (), {"count": lambda s: 0})()
+
+        return Locator()
+
+
+class HomepageCoverTests(unittest.TestCase):
+    def _enter(self, page):
+        import bahamut_auto_bump as mod
+        saved = mod.time.sleep
+        mod.time.sleep = lambda s: None
+        try:
+            mod._enter_from_homepage_cover(page, {"selectors": {}, "browser": {"navigation_interval_seconds": 0}})
+        finally:
+            mod.time.sleep = saved
+
+    def test_follows_cover_link_to_homepage(self):
+        page = CoverPage("https://www.gamer.com.tw/index.php?ad=N")
+        self._enter(page)
+        self.assertEqual(page.visits, ["https://www.gamer.com.tw/index.php?ad=N"])
+
+    def test_rejects_cover_link_to_other_host(self):
+        page = CoverPage("https://ads.example.com/index.php")
+        with self.assertRaises(CannotConfirm):
+            self._enter(page)
+        self.assertEqual(page.visits, [])
 
 
 class StateRoundTripTests(unittest.TestCase):

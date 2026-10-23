@@ -32,6 +32,10 @@ class CannotConfirm(RuntimeError):
     """Raised whenever the page state is not safe enough to make a decision."""
 
 
+class RateLimited(CannotConfirm):
+    """Bahamut kept answering with its HTTP 429 page; not an auth or layout problem."""
+
+
 @dataclass(frozen=True)
 class PostInfo:
     floor: int
@@ -114,6 +118,50 @@ def is_today(parsed: datetime, now: datetime) -> bool:
     return parsed.astimezone(now.tzinfo).date() == now.date()
 
 
+RATE_LIMIT_TITLE = "系統維修中"
+_last_navigation = 0.0
+
+
+def _pace(config: dict[str, Any]) -> None:
+    """Keep requests to Bahamut at least navigation_interval_seconds apart."""
+    global _last_navigation
+    interval = float(config["browser"].get("navigation_interval_seconds", 3))
+    wait = _last_navigation + interval - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_navigation = time.monotonic()
+
+
+def _rate_limited(page: Any, response: Any = None) -> bool:
+    if response is not None and getattr(response, "status", None) == 429:
+        return True
+    try:
+        return RATE_LIMIT_TITLE in page.title()
+    except Exception:
+        return False
+
+
+def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
+    """Navigate politely and wait out Bahamut's burst rate limit.
+
+    Bahamut answers request bursts with an HTTP 429 "系統維修中" page that has
+    no posts or site messages. Without this, a full thread scan surfaces the
+    limit as missing posts, failed login or unverifiable deletions.
+    """
+    backoff = max(1, int(config["browser"].get("rate_limit_wait_seconds", 60)))
+    retries = max(0, int(config["browser"].get("rate_limit_retries", 3)))
+    path = urllib.parse.urlparse(url).path or url
+    for attempt in range(retries + 1):
+        _pace(config)
+        response = page.goto(url, wait_until="domcontentloaded")
+        if not _rate_limited(page, response):
+            return response
+        if attempt < retries:
+            LOG.warning("Bahamut rate limited %s; waiting %s seconds", path, backoff * (attempt + 1))
+            time.sleep(backoff * (attempt + 1))
+    raise RateLimited(f"Bahamut rate limit (HTTP 429 {RATE_LIMIT_TITLE}) persisted for {path}")
+
+
 def _navigate_to_last_page(page: Any, config: dict[str, Any]) -> None:
     """Jump to the newest thread page, staying put when no later page is advertised."""
     current = urllib.parse.urlparse(str(page.url))
@@ -121,7 +169,7 @@ def _navigate_to_last_page(page: Any, config: dict[str, Any]) -> None:
     urls = _thread_page_urls(page, config)
     if len(urls) <= current_page:
         return
-    page.goto(urls[-1], wait_until="domcontentloaded")
+    _goto(page, urls[-1], config)
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
         page.locator(selector).first.wait_for(
@@ -204,7 +252,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
             and current_query.get("snA") == configured_query.get("snA")
         )
         if not same_thread or page.locator(selector).count() == 0:
-            page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+            _goto(page, str(config["thread"]["url"]), config)
         page.locator(selector).first.wait_for(state="attached", timeout=timeout)
         page_urls = _thread_page_urls(page, config)
     except Exception as exc:
@@ -220,7 +268,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
     result: list[PostInfo] = []
     for page_url in page_urls:
         if str(page.url) != page_url:
-            page.goto(page_url, wait_until="domcontentloaded")
+            _goto(page, page_url, config)
         try:
             posts_locator = page.locator(selector)
             if posts_locator.count() == 0:
@@ -339,7 +387,7 @@ def _delete_request(page: Any, sn: str) -> dict[str, str]:
 
 def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
     # pdel is generated on thread pages and contains the current delete token.
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     page.locator(selector).first.wait_for(
         state="attached", timeout=int(config["browser"].get("navigation_timeout_ms", 30000))
@@ -352,7 +400,7 @@ def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
         )
     endpoint = urllib.parse.urljoin(str(page.url), "post2.php?" + request["args"])
     try:
-        page.goto(endpoint, wait_until="domcontentloaded")
+        _goto(page, endpoint, config)
     except Exception as exc:
         # Bahamut may redirect while Playwright is waiting for DOMContentLoaded;
         # the caller always verifies the post is gone before treating this as success.
@@ -370,14 +418,16 @@ def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> No
         str(config["thread"]["url"]),
         "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": post.sn}),
     )
-    page.goto(verification_url, wait_until="domcontentloaded")
+    _goto(page, verification_url, config)
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     page.locator("body").wait_for(state="attached", timeout=timeout)
     if page.locator(f"#post_{post.sn}").count():
         raise CannotConfirm(f"Delete request completed but floor {post.floor} is still present")
     body_text = page.locator("body").inner_text(timeout=timeout)
     if "此文章/討論串不存在或已被刪除" not in body_text:
-        raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
+        raise CannotConfirm(
+            f"Could not verify deletion of floor {post.floor} from Bahamut's response; title={page.title()!r}"
+        )
 
 
 def cleanup_previous_reply(page: Any, config: dict[str, Any], target: PostInfo, posts: list[PostInfo]) -> None:
@@ -486,7 +536,7 @@ def _first_visible(page: Any, selectors: str):
 def _authenticated_thread_page(page: Any, config: dict[str, Any]) -> None:
     """Navigate to the thread and fail closed unless the account is signed in."""
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.set_default_timeout(timeout)
     title = page.title()
     if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
@@ -517,6 +567,8 @@ def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
         raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
     try:
         _authenticated_thread_page(page, config)
+    except RateLimited:
+        raise
     except CannotConfirm as exc:
         raise CannotConfirm(
             f"Imported browser storage_state is expired or not authenticated: {exc}"
@@ -554,6 +606,23 @@ def _dismiss_homepage_onboarding(page: Any, config: dict[str, Any]) -> None:
         prompt.wait_for(state="hidden", timeout=min(int(config["browser"].get("navigation_timeout_ms", 30000)), 5000))
     except Exception as exc:
         raise CannotConfirm("Could not dismiss the homepage login onboarding prompt") from exc
+
+
+def _enter_from_homepage_cover(page: Any, config: dict[str, Any]) -> None:
+    """Follow the full-page cover ad's "進入巴哈姆特" link to the real homepage.
+
+    On cover days www.gamer.com.tw/ only shows an ad iframe and this link; the
+    navigation bar with the login trigger lives on the index.php it points to.
+    """
+    selector = str(config["selectors"].get("homepage_cover_enter", ".sky a[href*='index.php']"))
+    link = _first_visible(page, selector)
+    if not link:
+        return
+    target = urllib.parse.urlparse(str(link.evaluate("element => element.href")))
+    if target.scheme != "https" or target.netloc not in {"www.gamer.com.tw", "gamer.com.tw"}:
+        raise CannotConfirm("Homepage cover link does not lead to the Bahamut homepage")
+    LOG.info("Homepage is showing a cover ad; entering the homepage through its link")
+    _goto(page, target.geturl(), config)
 
 
 def _account_credentials(config: dict[str, Any]) -> tuple[str, str, str]:
@@ -596,13 +665,14 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
         or parsed_homepage.path not in {"", "/"}
     ):
         raise CannotConfirm("Automatic login homepage_url must be https://www.gamer.com.tw/")
-    page.goto(homepage, wait_until="domcontentloaded")
+    _goto(page, homepage, config)
     title = page.title()
     if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
         raise CannotConfirm(
             f"Bahamut anti-bot challenge blocked the homepage login; url={page.url!r}, title={title!r}"
         )
     try:
+        _enter_from_homepage_cover(page, config)
         _dismiss_homepage_onboarding(page, config)
         trigger_selector = str(config["selectors"].get(
             "login_trigger",
@@ -645,6 +715,8 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     page.wait_for_timeout(1000)
     try:
         _authenticated_thread_page(page, config)
+    except RateLimited:
+        raise
     except CannotConfirm as exc:
         raise CannotConfirm(f"Automatic homepage login failed: {exc}") from exc
     storage_state = str(config["browser"].get("storage_state", "")).strip()
@@ -665,6 +737,8 @@ def authenticate(page: Any, config: dict[str, Any]) -> None:
         try:
             verify_imported_session(page, config)
             return
+        except RateLimited:
+            raise
         except CannotConfirm as exc:
             LOG.warning("Imported session unavailable; attempting homepage login: %s", exc)
     login_from_homepage(page, config)
@@ -721,7 +795,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     if "pending_bump" in state:
         LOG.info("Checking the previous unfinished bump before starting another")
         recovered = finish_pending_bump(page, config, state, collect_posts(page, config), now)
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.set_default_timeout(int(config["browser"].get("navigation_timeout_ms", 30000)))
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
@@ -751,7 +825,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         "before_sn": max(int(post.sn) for post in posts),
         "previous_reply": {"floor": target.floor, "sn": target.sn} if target else None,
     }
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.locator(selector).first.wait_for(state="attached")
     _navigate_to_last_page(page, config)
     if is_today(latest_post_timestamp(page, config, now), now):
@@ -770,6 +844,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     if not editor:
         raise CannotConfirm("Reply editor layout is not recognized")
     editor_tag = editor.evaluate("element => element.tagName")
+    _pace(config)
     if editor_tag == "IFRAME":
         page.evaluate(
             """
@@ -816,13 +891,32 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         page.wait_for_load_state("domcontentloaded", timeout=int(config["browser"].get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
         LOG.warning("Reply navigation timed out; checking from an independent page")
+    submit_rate_limited = _rate_limited(page)
+    try:
+        # Bahamut reports rejected replies (flood interval, content rules) on a
+        # system message page; keep its text for the failure notification.
+        submit_response = f"title={page.title()!r}, message={' '.join(page.locator('body').inner_text(timeout=5000).split())[:120]!r}"
+    except Exception:
+        submit_response = "<unavailable>"
+    if submit_rate_limited:
+        # The reply may still have been stored; let the limit clear before the
+        # verification scan instead of guessing either way.
+        wait = max(1, int(config["browser"].get("rate_limit_wait_seconds", 60)))
+        LOG.warning("Reply submission hit Bahamut's rate limit; waiting %s seconds before verifying", wait)
+        time.sleep(wait)
     verification_page = page.context.new_page()
     try:
         verified_posts = collect_posts(verification_page, config)
     finally:
         verification_page.close()
     if not finish_pending_bump(page, config, state, verified_posts, now):
-        raise CannotConfirm("Reply was submitted but no new owned reply could be verified")
+        if submit_rate_limited:
+            raise CannotConfirm(
+                f"Reply submission was rejected by Bahamut's rate limit (HTTP 429 {RATE_LIMIT_TITLE}); it will be retried"
+            )
+        raise CannotConfirm(
+            f"Reply was submitted but no new owned reply could be verified; Bahamut response: {submit_response}"
+        )
     return "posted"
 
 
