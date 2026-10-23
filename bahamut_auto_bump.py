@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 LOG = logging.getLogger("bahamut-auto-bump")
 DEFAULT_CONFIG = Path("config.toml")
+DEFAULT_TEMPLATE = "頂🆙！\n（{timestamp}）"
 
 
 class ConfigError(ValueError):
@@ -32,12 +33,24 @@ class CannotConfirm(RuntimeError):
     """Raised whenever the page state is not safe enough to make a decision."""
 
 
+class RateLimited(CannotConfirm):
+    """Bahamut kept answering with its HTTP 429 page; not an auth or layout problem."""
+
+
 @dataclass(frozen=True)
 class PostInfo:
     floor: int
     sn: str
     owner: bool
     raw_time: str
+    bump: bool = False
+
+
+def is_bump_text(text: str, template: str) -> bool:
+    """Match a rendered post body against content_template, ignoring whitespace."""
+    parts = ["".join(part.split()) for part in template.split("{timestamp}")]
+    pattern = r"\d{4}-\d{2}-\d{2}\d{2}:\d{2}:\d{2}UTC\+8".join(map(re.escape, parts))
+    return re.fullmatch(pattern, "".join(text.split())) is not None
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -114,6 +127,50 @@ def is_today(parsed: datetime, now: datetime) -> bool:
     return parsed.astimezone(now.tzinfo).date() == now.date()
 
 
+RATE_LIMIT_TITLE = "系統維修中"
+_last_navigation = 0.0
+
+
+def _pace(config: dict[str, Any]) -> None:
+    """Keep requests to Bahamut at least navigation_interval_seconds apart."""
+    global _last_navigation
+    interval = float(config["browser"].get("navigation_interval_seconds", 3))
+    wait = _last_navigation + interval - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
+    _last_navigation = time.monotonic()
+
+
+def _rate_limited(page: Any, response: Any = None) -> bool:
+    if response is not None and getattr(response, "status", None) == 429:
+        return True
+    try:
+        return RATE_LIMIT_TITLE in page.title()
+    except Exception:
+        return False
+
+
+def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
+    """Navigate politely and wait out Bahamut's burst rate limit.
+
+    Bahamut answers request bursts with an HTTP 429 "系統維修中" page that has
+    no posts or site messages. Without this, a full thread scan surfaces the
+    limit as missing posts, failed login or unverifiable deletions.
+    """
+    backoff = max(1, int(config["browser"].get("rate_limit_wait_seconds", 60)))
+    retries = max(0, int(config["browser"].get("rate_limit_retries", 3)))
+    path = urllib.parse.urlparse(url).path or url
+    for attempt in range(retries + 1):
+        _pace(config)
+        response = page.goto(url, wait_until="domcontentloaded")
+        if not _rate_limited(page, response):
+            return response
+        if attempt < retries:
+            LOG.warning("Bahamut rate limited %s; waiting %s seconds", path, backoff * (attempt + 1))
+            time.sleep(backoff * (attempt + 1))
+    raise RateLimited(f"Bahamut rate limit (HTTP 429 {RATE_LIMIT_TITLE}) persisted for {path}")
+
+
 def _navigate_to_last_page(page: Any, config: dict[str, Any]) -> None:
     """Jump to the newest thread page, staying put when no later page is advertised."""
     current = urllib.parse.urlparse(str(page.url))
@@ -121,7 +178,7 @@ def _navigate_to_last_page(page: Any, config: dict[str, Any]) -> None:
     urls = _thread_page_urls(page, config)
     if len(urls) <= current_page:
         return
-    page.goto(urls[-1], wait_until="domcontentloaded")
+    _goto(page, urls[-1], config)
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
         page.locator(selector).first.wait_for(
@@ -167,7 +224,9 @@ def _thread_page_urls(page: Any, config: dict[str, Any]) -> list[str]:
         )
     except Exception as exc:
         raise CannotConfirm(f"Could not inspect thread pagination: {exc}") from exc
-    pages = {1}
+    # Bahamut's pagination does not link the page being viewed, so a scan
+    # started from the last page would otherwise silently skip that page.
+    pages = {1, int(current_query.get("page", ["1"])[0])}
     for href in hrefs:
         parsed = urllib.parse.urlparse(str(href))
         query = urllib.parse.parse_qs(parsed.query)
@@ -192,6 +251,8 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config["selectors"].get("post_time_selector", ".edittime"))
+    content_selector = str(config["selectors"].get("post_content_selector", ".c-article__content"))
+    template = str(config["thread"].get("content_template", DEFAULT_TEMPLATE))
     page.set_default_timeout(timeout)
     try:
         configured = urllib.parse.urlparse(str(config["thread"]["url"]))
@@ -204,7 +265,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
             and current_query.get("snA") == configured_query.get("snA")
         )
         if not same_thread or page.locator(selector).count() == 0:
-            page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+            _goto(page, str(config["thread"]["url"]), config)
         page.locator(selector).first.wait_for(state="attached", timeout=timeout)
         page_urls = _thread_page_urls(page, config)
     except Exception as exc:
@@ -220,7 +281,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
     result: list[PostInfo] = []
     for page_url in page_urls:
         if str(page.url) != page_url:
-            page.goto(page_url, wait_until="domcontentloaded")
+            _goto(page, page_url, config)
         try:
             posts_locator = page.locator(selector)
             if posts_locator.count() == 0:
@@ -240,7 +301,7 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
             posts_locator.first.wait_for(state="attached", timeout=timeout)
             rows = page.locator("section[id^='post_']").evaluate_all(
                 """
-                (sections, timeSelector) => sections.map((section) => {
+                (sections, {timeSelector, contentSelector}) => sections.map((section) => {
                   const floorLink = Array.from(section.querySelectorAll('a')).find(a => /\\d+\\s*樓/.test((a.textContent || '').trim()));
                   // The section also contains data-tippy attributes for GP/BP
                   // counters; only the option-menu metadata includes owner.
@@ -252,11 +313,12 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
                     floor: (floorLink?.textContent || '').match(/(\\d+)\\s*樓/)?.[1] || '',
                     sn: String(meta.sn || section.id.replace(/^post_/, '')),
                     owner: meta.owner === true,
-                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || ''
+                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || '',
+                    text: section.querySelector(contentSelector)?.innerText || ''
                   };
                 }).filter(item => item.sn)
                 """,
-                time_selector,
+                {"timeSelector": time_selector, "contentSelector": content_selector},
             )
         except CannotConfirm:
             raise
@@ -278,14 +340,19 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
                 raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
             if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
                 raise CannotConfirm("Could not determine a valid post number")
-            result.append(PostInfo(floor, str(row["sn"]), bool(row["owner"]), str(row["raw"])))
+            result.append(PostInfo(
+                floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), is_bump_text(str(row["text"]), template),
+            ))
     if not result:
         raise CannotConfirm("No posts were found for cleanup")
     return sorted({post.sn: post for post in result}.values(), key=lambda post: post.floor)
 
 
 def deletion_candidates(posts: list[PostInfo], keep_latest_replies: int = 1) -> list[PostInfo]:
-    """Choose owned replies older than the retained newest replies; floor 1 is immutable.
+    """Choose owned bump replies older than the retained newest bumps; floor 1 is immutable.
+
+    Only replies matching content_template are considered, so the owner's
+    other replies in the thread are never deleted.
 
     Bahamut may leave non-contiguous/reused-looking floor labels after deletes.
     The post number (sn) is monotonic across the whole thread, so it is the
@@ -300,7 +367,7 @@ def deletion_candidates(posts: list[PostInfo], keep_latest_replies: int = 1) -> 
             sn = -1
         return sn, post.floor
 
-    replies = sorted((post for post in posts if post.floor > 1 and post.owner), key=order_key, reverse=True)
+    replies = sorted((post for post in posts if post.floor > 1 and post.owner and post.bump), key=order_key, reverse=True)
     return replies[keep:]
 
 
@@ -339,7 +406,7 @@ def _delete_request(page: Any, sn: str) -> dict[str, str]:
 
 def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
     # pdel is generated on thread pages and contains the current delete token.
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     page.locator(selector).first.wait_for(
         state="attached", timeout=int(config["browser"].get("navigation_timeout_ms", 30000))
@@ -352,7 +419,7 @@ def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
         )
     endpoint = urllib.parse.urljoin(str(page.url), "post2.php?" + request["args"])
     try:
-        page.goto(endpoint, wait_until="domcontentloaded")
+        _goto(page, endpoint, config)
     except Exception as exc:
         # Bahamut may redirect while Playwright is waiting for DOMContentLoaded;
         # the caller always verifies the post is gone before treating this as success.
@@ -370,29 +437,16 @@ def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> No
         str(config["thread"]["url"]),
         "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": post.sn}),
     )
-    page.goto(verification_url, wait_until="domcontentloaded")
+    _goto(page, verification_url, config)
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     page.locator("body").wait_for(state="attached", timeout=timeout)
     if page.locator(f"#post_{post.sn}").count():
         raise CannotConfirm(f"Delete request completed but floor {post.floor} is still present")
     body_text = page.locator("body").inner_text(timeout=timeout)
     if "此文章/討論串不存在或已被刪除" not in body_text:
-        raise CannotConfirm(f"Could not verify deletion of floor {post.floor} from Bahamut's response")
-
-
-def cleanup_previous_reply(page: Any, config: dict[str, Any], target: PostInfo, posts: list[PostInfo]) -> None:
-    current = next((post for post in posts if post.sn == target.sn), None)
-    if current is not None:
-        if current not in deletion_candidates(posts, keep_latest_replies=1):
-            raise CannotConfirm(f"Pending cleanup post {target.sn} is no longer an older owned reply")
-        if not config["cleanup"].get("enabled", False) or config["cleanup"].get("dry_run", True):
-            raise CannotConfirm("Pending cleanup is paused while cleanup is disabled or dry-run")
-        delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
-        LOG.info("Waiting %s seconds before deleting previous bump sn=%s", delay, target.sn)
-        time.sleep(delay)
-        delete_post(page, config, current)
-    verify_post_deleted(page, config, target)
-    LOG.info("Confirmed previous bump is deleted (sn=%s)", target.sn)
+        raise CannotConfirm(
+            f"Could not verify deletion of floor {post.floor} from Bahamut's response; title={page.title()!r}"
+        )
 
 
 def finish_pending_bump(
@@ -405,17 +459,6 @@ def finish_pending_bump(
         before_sn = pending["before_sn"]
         if type(before_sn) is not int or before_sn <= 0:
             raise ValueError("Invalid pre-bump post number")
-        target = pending["previous_reply"]
-        if target is not None:
-            if (
-                not isinstance(target, dict)
-                or type(target["floor"]) is not int
-                or target["floor"] <= 1
-                or not isinstance(target["sn"], str)
-                or not re.fullmatch(r"[0-9]+", target["sn"])
-                or not 0 < int(target["sn"]) <= before_sn
-            ):
-                raise ValueError("Invalid pending cleanup target")
         if "posted_sn" in pending and date.fromisoformat(pending["posted_date"]) > now.date():
             raise ValueError("Confirmed bump date is in the future")
     except (KeyError, TypeError, ValueError) as exc:
@@ -434,24 +477,40 @@ def finish_pending_bump(
         write_state(state_path(config), state)
         LOG.info("Confirmed submitted bump sn=%s at %s", posted.sn, posted_at.isoformat())
 
-    if target is not None:
-        cleanup_previous_reply(
-            page, config, PostInfo(target["floor"], target["sn"], True, ""), posts,
-        )
+    # Clean every older bump, not just the previous one, so a missed day is
+    # caught up on the next bump instead of being left behind forever.
+    unrecognized = None
+    if config["cleanup"].get("enabled", False):
+        posted = next((post for post in posts if post.sn == pending["posted_sn"]), None)
+        if posted is not None and not posted.bump:
+            unrecognized = posted.sn
+        else:
+            delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
+            LOG.info("Waiting %s seconds before cleaning up older bumps", delay)
+            time.sleep(delay)
+            cleanup_thread(page, config, posts)
     state["last_confirmed_date"] = pending["posted_date"]
     del state["pending_bump"]
     write_state(state_path(config), state)
+    if unrecognized:
+        # The bump itself succeeded; fail loudly so a markup change cannot
+        # silently stop cleanup again.
+        raise CannotConfirm(
+            f"Bump sn={unrecognized} does not match content_template; older bumps were not cleaned up "
+            "(check selectors.post_content_selector)"
+        )
     return True
 
 
-def cleanup_thread(page: Any, config: dict[str, Any], max_deletions: int = 0) -> int:
-    posts = collect_posts(page, config)
-    keep = int(config["cleanup"].get("keep_latest_replies", 1))
+def cleanup_thread(page: Any, config: dict[str, Any], posts: list[PostInfo], max_deletions: int = 0) -> int:
+    # Keeping at least one bump stops cleanup from deleting today's bump and
+    # triggering a re-bump on the next check.
+    keep = max(1, int(config["cleanup"].get("keep_latest_replies", 1)))
     candidates = deletion_candidates(posts, keep_latest_replies=keep)
     if max_deletions > 0:
         candidates = candidates[:max_deletions]
     if not candidates:
-        LOG.info("No cleanup candidates; floor 1 and the newest %s owned replies are retained", keep)
+        LOG.info("No cleanup candidates; floor 1 and the newest %s bump(s) are retained", keep)
         return 0
     dry_run = bool(config["cleanup"].get("dry_run", True))
     interval = max(5, int(config["cleanup"].get("interval_seconds", 5)))
@@ -486,7 +545,7 @@ def _first_visible(page: Any, selectors: str):
 def _authenticated_thread_page(page: Any, config: dict[str, Any]) -> None:
     """Navigate to the thread and fail closed unless the account is signed in."""
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.set_default_timeout(timeout)
     title = page.title()
     if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
@@ -517,6 +576,8 @@ def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
         raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
     try:
         _authenticated_thread_page(page, config)
+    except RateLimited:
+        raise
     except CannotConfirm as exc:
         raise CannotConfirm(
             f"Imported browser storage_state is expired or not authenticated: {exc}"
@@ -554,6 +615,23 @@ def _dismiss_homepage_onboarding(page: Any, config: dict[str, Any]) -> None:
         prompt.wait_for(state="hidden", timeout=min(int(config["browser"].get("navigation_timeout_ms", 30000)), 5000))
     except Exception as exc:
         raise CannotConfirm("Could not dismiss the homepage login onboarding prompt") from exc
+
+
+def _enter_from_homepage_cover(page: Any, config: dict[str, Any]) -> None:
+    """Follow the full-page cover ad's "進入巴哈姆特" link to the real homepage.
+
+    On cover days www.gamer.com.tw/ only shows an ad iframe and this link; the
+    navigation bar with the login trigger lives on the index.php it points to.
+    """
+    selector = str(config["selectors"].get("homepage_cover_enter", ".sky a[href*='index.php']"))
+    link = _first_visible(page, selector)
+    if not link:
+        return
+    target = urllib.parse.urlparse(str(link.evaluate("element => element.href")))
+    if target.scheme != "https" or target.netloc not in {"www.gamer.com.tw", "gamer.com.tw"}:
+        raise CannotConfirm("Homepage cover link does not lead to the Bahamut homepage")
+    LOG.info("Homepage is showing a cover ad; entering the homepage through its link")
+    _goto(page, target.geturl(), config)
 
 
 def _account_credentials(config: dict[str, Any]) -> tuple[str, str, str]:
@@ -596,13 +674,14 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
         or parsed_homepage.path not in {"", "/"}
     ):
         raise CannotConfirm("Automatic login homepage_url must be https://www.gamer.com.tw/")
-    page.goto(homepage, wait_until="domcontentloaded")
+    _goto(page, homepage, config)
     title = page.title()
     if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
         raise CannotConfirm(
             f"Bahamut anti-bot challenge blocked the homepage login; url={page.url!r}, title={title!r}"
         )
     try:
+        _enter_from_homepage_cover(page, config)
         _dismiss_homepage_onboarding(page, config)
         trigger_selector = str(config["selectors"].get(
             "login_trigger",
@@ -645,6 +724,8 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     page.wait_for_timeout(1000)
     try:
         _authenticated_thread_page(page, config)
+    except RateLimited:
+        raise
     except CannotConfirm as exc:
         raise CannotConfirm(f"Automatic homepage login failed: {exc}") from exc
     storage_state = str(config["browser"].get("storage_state", "")).strip()
@@ -665,6 +746,8 @@ def authenticate(page: Any, config: dict[str, Any]) -> None:
         try:
             verify_imported_session(page, config)
             return
+        except RateLimited:
+            raise
         except CannotConfirm as exc:
             LOG.warning("Imported session unavailable; attempting homepage login: %s", exc)
     login_from_homepage(page, config)
@@ -721,7 +804,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     if "pending_bump" in state:
         LOG.info("Checking the previous unfinished bump before starting another")
         recovered = finish_pending_bump(page, config, state, collect_posts(page, config), now)
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.set_default_timeout(int(config["browser"].get("navigation_timeout_ms", 30000)))
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     try:
@@ -735,23 +818,17 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         state.pop("pending_bump", None)
         state["last_confirmed_date"] = now.date().isoformat()
         write_state(path, state)
+        if not recovered and config["cleanup"].get("enabled", False):
+            # A dropped pending bump skipped its cleanup; catch up here.
+            cleanup_thread(page, config, collect_posts(page, config))
         return "recovered" if recovered else "already_done"
 
     posts = collect_posts(page, config)
-    previous = deletion_candidates(posts, keep_latest_replies=0)
-    target = previous[0] if previous else None
-    if not config["cleanup"].get("enabled", False):
-        target = None
-    elif config["cleanup"].get("dry_run", True):
-        if target:
-            LOG.info("Cleanup dry-run: would delete floor %s (sn=%s) after a successful bump", target.floor, target.sn)
-        target = None
     state["pending_bump"] = {
         "thread_url": str(config["thread"]["url"]),
         "before_sn": max(int(post.sn) for post in posts),
-        "previous_reply": {"floor": target.floor, "sn": target.sn} if target else None,
     }
-    page.goto(str(config["thread"]["url"]), wait_until="domcontentloaded")
+    _goto(page, str(config["thread"]["url"]), config)
     page.locator(selector).first.wait_for(state="attached")
     _navigate_to_last_page(page, config)
     if is_today(latest_post_timestamp(page, config, now), now):
@@ -760,7 +837,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         write_state(path, state)
         return "recovered" if recovered else "already_done"
     write_state(path, state)
-    body = str(config["thread"].get("content_template", "頂🆙！\n（{timestamp}）")).format(
+    body = str(config["thread"].get("content_template", DEFAULT_TEMPLATE)).format(
         timestamp=now.strftime("%Y-%m-%d %H:%M:%S UTC+8")
     )
     editor_selector = str(config["selectors"].get("editor", "#editor"))
@@ -770,6 +847,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     if not editor:
         raise CannotConfirm("Reply editor layout is not recognized")
     editor_tag = editor.evaluate("element => element.tagName")
+    _pace(config)
     if editor_tag == "IFRAME":
         page.evaluate(
             """
@@ -816,13 +894,32 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         page.wait_for_load_state("domcontentloaded", timeout=int(config["browser"].get("navigation_timeout_ms", 30000)))
     except PlaywrightTimeoutError:
         LOG.warning("Reply navigation timed out; checking from an independent page")
+    submit_rate_limited = _rate_limited(page)
+    try:
+        # Bahamut reports rejected replies (flood interval, content rules) on a
+        # system message page; keep its text for the failure notification.
+        submit_response = f"title={page.title()!r}, message={' '.join(page.locator('body').inner_text(timeout=5000).split())[:120]!r}"
+    except Exception:
+        submit_response = "<unavailable>"
+    if submit_rate_limited:
+        # The reply may still have been stored; let the limit clear before the
+        # verification scan instead of guessing either way.
+        wait = max(1, int(config["browser"].get("rate_limit_wait_seconds", 60)))
+        LOG.warning("Reply submission hit Bahamut's rate limit; waiting %s seconds before verifying", wait)
+        time.sleep(wait)
     verification_page = page.context.new_page()
     try:
         verified_posts = collect_posts(verification_page, config)
     finally:
         verification_page.close()
     if not finish_pending_bump(page, config, state, verified_posts, now):
-        raise CannotConfirm("Reply was submitted but no new owned reply could be verified")
+        if submit_rate_limited:
+            raise CannotConfirm(
+                f"Reply submission was rejected by Bahamut's rate limit (HTTP 429 {RATE_LIMIT_TITLE}); it will be retried"
+            )
+        raise CannotConfirm(
+            f"Reply was submitted but no new owned reply could be verified; Bahamut response: {submit_response}"
+        )
     return "posted"
 
 
@@ -838,7 +935,7 @@ def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
     """Run the explicit cleanup command in the same authenticated Chrome session."""
     with bump_lock(config), chrome_page(config) as page:
         authenticate(page, config)
-        return cleanup_thread(page, config, max_deletions=max_deletions)
+        return cleanup_thread(page, config, collect_posts(page, config), max_deletions=max_deletions)
 
 
 def test_imported_session(config: dict[str, Any]) -> None:
