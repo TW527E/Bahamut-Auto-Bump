@@ -11,6 +11,8 @@ password = "#form-login input[name='password'], input[name='password']"
 totp = "#input-2sa, input[name='twoStepAuth'], input[name='otp'], input[name='code']"
 login_submit = "#form-login button[type='submit'], #form-login input[type='submit'], #btn-login"
 logged_out_selector = "#BH-top-data a[href*='login.php'], a.main-nav__link[onclick*='requireLoginIframe'], a[onclick*='requireLoginIframe']"
+# Full-page cover ad that sometimes replaces https://www.gamer.com.tw/.
+homepage_cover_enter = ".sky a[href*='index.php']"
 login_onboarding = "#driver-popover-content"
 login_onboarding_close = "#driver-popover-content button[aria-label='Close'], #driver-popover-content .driver-popover-close-btn, #driver-popover-content button"
 post_selector = "#BH-master > section[id^='post_'] .c-post"
@@ -29,6 +31,11 @@ totp_secret = ""
 [browser]
 headless = true
 navigation_timeout_ms = 30000
+# Bahamut answers request bursts with HTTP 429 "系統維修中". Space page loads
+# apart and wait out the limit (rate_limit_wait_seconds grows per retry).
+navigation_interval_seconds = 3
+rate_limit_wait_seconds = 60
+rate_limit_retries = 3
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"

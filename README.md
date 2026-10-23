@@ -4,6 +4,8 @@ Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特�
 
 安全行為：匯入的 Cookie/session 失效、首頁登入失敗、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。腳本會優先使用有效的 Playwright `storage_state`，失效或不存在時才從巴哈姆特首頁右上角登入入口進行帳號、密碼與可選 TOTP 登入；不會直接導向 `login.php`，也不會繞過 CAPTCHA 或站方反爬驗證。
 
+巴哈姆特會對短時間大量請求回應 HTTP 429「系統維修中｜請關閉頁面後稍後再試」，這頁沒有文章也沒有站方訊息。腳本每次換頁至少間隔 `browser.navigation_interval_seconds`（預設 3 秒），遇到 429 會等待 `rate_limit_wait_seconds`（預設 60 秒，每次重試遞增）後重試最多 `rate_limit_retries` 次，仍被限制才回報錯誤；長文章的完整掃描因此會花上數分鐘。
+
 若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chrome，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
 
 若伺服器已能正常使用帳密登入，可在設定檔提供帳號資料；也可以在有圖形介面與正常瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
@@ -33,7 +35,7 @@ totp_secret = "你的 TOTP Base32 秘密（沒有就留空）"
 homepage_url = "https://www.gamer.com.tw/"
 ```
 
-腳本會先開啟 `homepage_url`。若首頁第一次顯示「登入後可從置頂導航搜尋、接收通知與展開個人選單」提示，會先按下 `Close` 關閉，再點擊右上角「登入」，最後填寫登入 iframe 中的欄位；提示不存在時會直接略過。所有登入選擇器（包含 `login_onboarding` 與 `login_onboarding_close`）都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
+腳本會先開啟 `homepage_url`。若首頁當天顯示全版封面廣告（只有「進入巴哈姆特 >>」連結），會先點進該連結指向的首頁（`homepage_cover_enter` 選擇器）。若首頁第一次顯示「登入後可從置頂導航搜尋、接收通知與展開個人選單」提示，會先按下 `Close` 關閉，再點擊右上角「登入」，最後填寫登入 iframe 中的欄位；提示不存在時會直接略過。所有登入選擇器（包含 `login_onboarding` 與 `login_onboarding_close`）都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
 
 這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若 VPS 仍看到 `請稍候...`，代表反爬驗證不接受轉移的 session，應改在被允許的網路環境執行，不能靠腳本繞過驗證。
 
