@@ -13,7 +13,8 @@ Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特�
 ```sh
 python export_bahamut_session.py --output bahamut-session.json
 chmod 600 bahamut-session.json
-scp bahamut-session.json root@goodvnic:/opt/Bahamut-Auto-Bump/
+scp bahamut-session.json user@your-server:/tmp/
+# 在伺服器上：sudo install -m 600 -o bahamut-bump -g bahamut-bump /tmp/bahamut-session.json /opt/Bahamut-Auto-Bump/
 ```
 
 在 Linux 的 `config.toml` 設定（`storage_state` 可保留作為優先使用的 session）：
@@ -135,7 +136,7 @@ journalctl -u bahamut-auto-bump.service -f
 
 ## Telegram 通知與指令
 
-成功頂文與錯誤通知都會發送到 `target_chat_id` 頻道；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。瀏覽器正在執行頂文或清理時，指令會等該次瀏覽器操作結束後處理。
+成功頂文通知會發送到 `target_chat_id` 頻道，錯誤與失敗通知則私訊給 `admin_chat_id`；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。瀏覽器正在執行頂文或清理時，指令會等該次瀏覽器操作結束後處理。
 
 Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。輸入 `/toggle` 會顯示中文通知選單；每個按鈕以 `✅` 表示開啟、`❌` 表示關閉，不使用括弧顯示狀態。點擊後按鈕會立即切換並刷新為最新狀態，也支援 `/toggle success` 直接切換指定類型：
 
@@ -152,6 +153,6 @@ Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天�
 
 「今天已經頂過」是例行檢查結果，不會發送通知。Telegram API 連線失敗只寫入 systemd 日誌，避免通知失敗造成無限遞迴。Bot 必須能讀取管理者私聊訊息；若使用群組管理指令，請將該群組 ID 設為 `admin_chat_id`。
 
-`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查仍會將 `auth` 通知送到 `target_chat_id` 頻道。
+`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查會把 `auth` 通知私訊給 `admin_chat_id`。同一種問題（類型與原因都相同）一天只通知一次，服務仍會照 `retry_interval_seconds` 持續重試。
 
 請勿把 `config.toml` 或 `bahamut-session.json` 提交到 Git，也不要分享匯出的 Cookie/session。使用本工具前請確認符合巴哈姆特帳號安全政策與版規。
