@@ -463,5 +463,24 @@ class StateRoundTripTests(unittest.TestCase):
                 read_state(path)
 
 
+
+class FailureNoticeTests(unittest.TestCase):
+    def test_the_same_failure_is_reported_once_a_day(self):
+        from bahamut_auto_bump import FailureNotice
+
+        notice = FailureNotice()
+        self.assertTrue(notice.should_send("auth", "session expired", "2026-11-01"))
+        self.assertFalse(notice.should_send("auth", "session expired", "2026-11-01"))
+        self.assertTrue(notice.should_send("auth", "session expired", "2026-11-02"))
+
+    def test_a_new_reason_or_a_success_reports_again(self):
+        from bahamut_auto_bump import FailureNotice
+
+        notice = FailureNotice()
+        notice.should_send("auth", "session expired", "2026-11-01")
+        self.assertTrue(notice.should_send("layout", "selector missing", "2026-11-01"))
+        notice.reset()
+        self.assertTrue(notice.should_send("layout", "selector missing", "2026-11-01"))
+
 if __name__ == "__main__":
     unittest.main()

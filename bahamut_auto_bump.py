@@ -1327,10 +1327,34 @@ def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
         time.sleep(min(poll_interval, remaining))
 
 
+class FailureNotice:
+    """Notify a failure once, not on every retry.
+
+    A failure that keeps repeating (expired session, anti-bot page) used to
+    send a Telegram message every retry_interval_seconds, about 96 a day with
+    the default. The same kind and reason are now reported once per day; a new
+    reason, a new day or a success in between reports again.
+    """
+
+    def __init__(self) -> None:
+        self.last: tuple[str, str, str] | None = None
+
+    def should_send(self, kind: str, reason: str, day: str) -> bool:
+        signature = (day, kind, reason)
+        if signature == self.last:
+            return False
+        self.last = signature
+        return True
+
+    def reset(self) -> None:
+        self.last = None
+
+
 def run_loop(config: dict[str, Any]) -> None:
     retry = int(config["schedule"]["retry_interval_seconds"])
     path = state_path(config)
     notifier = TelegramNotifier(config)
+    failures = FailureNotice()
     while True:
         notifier.poll_commands()
         now = taiwan_now(config)
@@ -1347,12 +1371,15 @@ def run_loop(config: dict[str, Any]) -> None:
                 sleep_with_telegram(min(max(30, int((due - now).total_seconds())), 3600), notifier)
                 continue
             result = run_once(notifier.configured(config))
+            failures.reset()
             if result in {"posted", "recovered"}:
                 message = "巴哈姆特頂文成功" if result == "posted" else "巴哈姆特上次頂文與清理已補完"
                 notifier.send("success", f"{message}\n文章：{config['thread']['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
         except Exception as exc:
             LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, retry)
-            notifier.send(notification_kind(exc), f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{notification_kind(exc)}\n原因：{exc}")
+            kind = notification_kind(exc)
+            if failures.should_send(kind, str(exc), now.date().isoformat()):
+                notifier.send(kind, f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{kind}\n原因：{exc}\n（同樣的問題今天不再重複通知，服務仍會每 {retry} 秒重試）")
             sleep_with_telegram(retry, notifier)
 
 
