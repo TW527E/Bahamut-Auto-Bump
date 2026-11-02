@@ -37,6 +37,10 @@ class RateLimited(CannotConfirm):
     """Bahamut kept answering with its HTTP 429 page; not an auth or layout problem."""
 
 
+class AntiBotChallenge(CannotConfirm):
+    """Cloudflare answered with its challenge page; headless Chrome cannot pass it."""
+
+
 @dataclass(frozen=True)
 class PostInfo:
     floor: int
@@ -150,8 +154,35 @@ def _rate_limited(page: Any, response: Any = None) -> bool:
         return False
 
 
+# Cloudflare's challenge first renders Bahamut's "系統異常回報" page, then its
+# own "請稍候..." page once the challenge script loads.
+CHALLENGE_TITLES = ("系統異常回報", "請稍候...", "Just a moment...")
+
+
+def _challenged(page: Any, response: Any = None) -> bool:
+    headers = getattr(response, "headers", None) or {}
+    if str(headers.get("cf-mitigated", "")).lower() == "challenge":
+        return True
+    try:
+        title = page.title()
+    except Exception:
+        return False
+    return any(marker in title for marker in CHALLENGE_TITLES) or "challenge" in title.lower()
+
+
+def _challenge_error(page: Any, where: str) -> AntiBotChallenge:
+    try:
+        title = page.title()
+    except Exception:
+        title = ""
+    return AntiBotChallenge(
+        f"Bahamut anti-bot challenge (Cloudflare) blocked {where}; this host's IP is being challenged; "
+        f"title={title!r}"
+    )
+
+
 def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
-    """Navigate politely and wait out Bahamut's burst rate limit.
+    """Navigate politely, wait out Bahamut's burst rate limit and fail on a challenge.
 
     Bahamut answers request bursts with an HTTP 429 "系統維修中" page that has
     no posts or site messages. Without this, a full thread scan surfaces the
@@ -159,10 +190,13 @@ def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
     """
     backoff = max(1, int(config["browser"].get("rate_limit_wait_seconds", 60)))
     retries = max(0, int(config["browser"].get("rate_limit_retries", 3)))
-    path = urllib.parse.urlparse(url).path or url
+    parsed = urllib.parse.urlparse(url)
+    path = parsed.path or url
     for attempt in range(retries + 1):
         _pace(config)
         response = page.goto(url, wait_until="domcontentloaded")
+        if _challenged(page, response):
+            raise _challenge_error(page, f"{parsed.netloc}{path}")
         if not _rate_limited(page, response):
             return response
         if attempt < retries:
@@ -289,10 +323,8 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
                 # page 2 may be empty while pages 14 and 16 still contain old
                 # replies. Skip a confirmed empty thread page and keep scanning.
                 title = page.title()
-                if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
-                    raise CannotConfirm(
-                        f"Bahamut anti-bot challenge blocked cleanup; url={page.url!r}, title={title!r}"
-                    )
+                if _challenged(page):
+                    raise _challenge_error(page, "the thread scan")
                 if page.locator("#BH-master").count() == 0:
                     raise CannotConfirm(f"Thread page layout is missing at {page_url}; title={title!r}")
                 page_number = urllib.parse.parse_qs(urllib.parse.urlparse(page_url).query).get("page", ["?"])[0]
@@ -547,11 +579,6 @@ def _authenticated_thread_page(page: Any, config: dict[str, Any]) -> None:
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     _goto(page, str(config["thread"]["url"]), config)
     page.set_default_timeout(timeout)
-    title = page.title()
-    if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
-        raise CannotConfirm(
-            f"Bahamut anti-bot challenge blocked the imported session; url={page.url!r}, title={title!r}"
-        )
     top_login = _first_visible(
         page,
         str(config["selectors"].get(
@@ -576,7 +603,7 @@ def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
         raise CannotConfirm(f"Configured browser storage_state file does not exist: {storage_state}")
     try:
         _authenticated_thread_page(page, config)
-    except RateLimited:
+    except (RateLimited, AntiBotChallenge):
         raise
     except CannotConfirm as exc:
         raise CannotConfirm(
@@ -585,6 +612,32 @@ def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
     except Exception as exc:
         raise CannotConfirm(f"Could not verify imported browser storage_state: {exc}") from exc
     LOG.info("Using authenticated Playwright storage state: %s", storage_state)
+    _save_session(page, config)
+
+
+def _save_session(page: Any, config: dict[str, Any]) -> None:
+    """Write the context's current cookies back to storage_state.
+
+    Bahamut rotates its login cookies as the account browses. A file saved only
+    after a homepage login drifts behind them and stopped being accepted within
+    about a day, forcing a homepage login that Cloudflare may block.
+    """
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
+    if not storage_state:
+        return
+    path = Path(storage_state)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        state = json.dumps(page.context.storage_state(), ensure_ascii=False)
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+            output.write(state)
+        temporary.chmod(0o600)
+        temporary.replace(path)
+    except OSError as exc:
+        LOG.warning("Could not save Playwright storage state %s: %s", storage_state, exc)
+        return
+    LOG.info("Saved authenticated Playwright storage state: %s", storage_state)
 
 
 def _login_frame(page: Any, config: dict[str, Any]):
@@ -675,11 +728,6 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     ):
         raise CannotConfirm("Automatic login homepage_url must be https://www.gamer.com.tw/")
     _goto(page, homepage, config)
-    title = page.title()
-    if title in {"請稍候...", "Just a moment..."} or "challenge" in title.lower():
-        raise CannotConfirm(
-            f"Bahamut anti-bot challenge blocked the homepage login; url={page.url!r}, title={title!r}"
-        )
     try:
         _enter_from_homepage_cover(page, config)
         _dismiss_homepage_onboarding(page, config)
@@ -724,33 +772,45 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     page.wait_for_timeout(1000)
     try:
         _authenticated_thread_page(page, config)
-    except RateLimited:
+    except (RateLimited, AntiBotChallenge):
         raise
     except CannotConfirm as exc:
         raise CannotConfirm(f"Automatic homepage login failed: {exc}") from exc
-    storage_state = str(config["browser"].get("storage_state", "")).strip()
-    if storage_state:
-        Path(storage_state).parent.mkdir(parents=True, exist_ok=True)
-        page.context.storage_state(path=storage_state)
-        try:
-            Path(storage_state).chmod(0o600)
-        except OSError:
-            pass
-        LOG.info("Saved authenticated Playwright storage state: %s", storage_state)
+    _save_session(page, config)
+
+
+# (monotonic deadline, message) while homepage login is paused after a challenge.
+_login_pause: tuple[float, str] | None = None
 
 
 def authenticate(page: Any, config: dict[str, Any]) -> None:
-    """Use a valid session first, then fall back to the homepage login flow."""
+    """Use a valid session first, then fall back to the homepage login flow.
+
+    Once Cloudflare challenges the homepage login, retrying it every
+    retry_interval_seconds only keeps the host's IP flagged, so the login is
+    paused for challenge_login_pause_seconds. The session is still checked on
+    every retry, so a fresh one uploaded with /session is used right away.
+    """
+    global _login_pause
     storage_state = str(config["browser"].get("storage_state", "")).strip()
     if storage_state and Path(storage_state).exists():
         try:
             verify_imported_session(page, config)
             return
-        except RateLimited:
+        except (RateLimited, AntiBotChallenge):
             raise
         except CannotConfirm as exc:
             LOG.warning("Imported session unavailable; attempting homepage login: %s", exc)
-    login_from_homepage(page, config)
+    if _login_pause and time.monotonic() < _login_pause[0]:
+        raise AntiBotChallenge(_login_pause[1])
+    try:
+        login_from_homepage(page, config)
+    except AntiBotChallenge as exc:
+        pause = max(0, int(config["browser"].get("challenge_login_pause_seconds", 21600)))
+        message = f"{exc}; homepage login paused for {pause} seconds, upload a fresh session with /session"
+        _login_pause = (time.monotonic() + pause, message)
+        raise AntiBotChallenge(message) from exc
+    _login_pause = None
 
 
 def _new_context(browser: Any, config: dict[str, Any], *, use_session: bool = True):
@@ -1306,6 +1366,8 @@ class TelegramNotifier:
 
 
 def notification_kind(exc: Exception) -> str:
+    if isinstance(exc, AntiBotChallenge):
+        return "auth"
     message = str(exc).lower()
     if any(word in message for word in ("login", "cookie", "session", "authenticated", "登入")):
         return "auth"

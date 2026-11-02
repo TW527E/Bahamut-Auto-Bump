@@ -10,3 +10,4 @@ __pycache__/
 bahamut-session.json
 .mimosa/
 .zcodeignore
+diagnostics/
