@@ -1,3 +1,4 @@
+import json
 import tempfile
 import unittest
 from datetime import datetime
@@ -5,6 +6,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from bahamut_auto_bump import (
+    AntiBotChallenge,
     CannotConfirm,
     NOTIFICATION_LABELS,
     NOTIFICATION_ORDER,
@@ -17,6 +19,7 @@ from bahamut_auto_bump import (
     finish_pending_bump,
     is_bump_text,
     load_config,
+    notification_kind,
     parse_post_time,
     read_state,
     write_state,
@@ -333,8 +336,9 @@ class PendingBumpTests(unittest.TestCase):
 
 
 class FakeResponse:
-    def __init__(self, status):
+    def __init__(self, status, headers=None):
         self.status = status
+        self.headers = headers or {}
 
 
 class RateLimitedPage:
@@ -481,6 +485,125 @@ class FailureNoticeTests(unittest.TestCase):
         self.assertTrue(notice.should_send("layout", "selector missing", "2026-11-01"))
         notice.reset()
         self.assertTrue(notice.should_send("layout", "selector missing", "2026-11-01"))
+
+
+class ChallengedPage:
+    def __init__(self, title, headers=None, status=200):
+        self._title = title
+        self.response = FakeResponse(status, headers)
+        self.visits = []
+        self.url = ""
+
+    def goto(self, url, wait_until=None):
+        self.visits.append(url)
+        self.url = url
+        return self.response
+
+    def title(self):
+        return self._title
+
+
+class AntiBotChallengeTests(unittest.TestCase):
+    config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_retries": 3}}
+
+    def _goto(self, page):
+        import bahamut_auto_bump as mod
+        mod._last_navigation = 0.0
+        mod._goto(page, "https://www.gamer.com.tw/", self.config)
+
+    def test_cloudflare_header_is_a_challenge(self):
+        page = ChallengedPage("巴哈姆特電玩資訊站", {"cf-mitigated": "challenge"}, status=403)
+        with self.assertRaises(AntiBotChallenge):
+            self._goto(page)
+        self.assertEqual(len(page.visits), 1)
+
+    def test_bahamut_challenge_titles_are_challenges(self):
+        for title in ("巴哈姆特電玩資訊站 - 系統異常回報", "請稍候..."):
+            with self.subTest(title=title), self.assertRaises(AntiBotChallenge) as ctx:
+                self._goto(ChallengedPage(title))
+            self.assertIn(title, str(ctx.exception))
+
+    def test_normal_page_passes(self):
+        self._goto(ChallengedPage("巴哈姆特電玩資訊站"))
+
+    def test_challenge_is_reported_as_auth(self):
+        self.assertEqual(notification_kind(AntiBotChallenge("blocked")), "auth")
+
+
+class LoginPauseTests(unittest.TestCase):
+    def setUp(self):
+        import bahamut_auto_bump as mod
+        self.mod = mod
+        self.saved = (mod.verify_imported_session, mod.login_from_homepage, mod._login_pause)
+        self.logins = []
+        mod._login_pause = None
+
+        def expired(page, config):
+            raise CannotConfirm("session expired")
+
+        mod.verify_imported_session = expired
+        self.tmp = tempfile.TemporaryDirectory()
+        session = Path(self.tmp.name) / "session.json"
+        session.write_text("{}", encoding="utf-8")
+        self.config = {"browser": {"storage_state": str(session), "challenge_login_pause_seconds": 3600}}
+
+    def tearDown(self):
+        self.mod.verify_imported_session, self.mod.login_from_homepage, self.mod._login_pause = self.saved
+        self.tmp.cleanup()
+
+    def _login(self, outcome):
+        def login(page, config):
+            self.logins.append(outcome)
+            if outcome:
+                raise outcome
+
+        self.mod.login_from_homepage = login
+
+    def test_challenged_login_is_not_retried_during_the_pause(self):
+        self._login(AntiBotChallenge("homepage challenged"))
+        with self.assertRaises(AntiBotChallenge) as first:
+            self.mod.authenticate(None, self.config)
+        with self.assertRaises(AntiBotChallenge) as second:
+            self.mod.authenticate(None, self.config)
+        self.assertEqual(len(self.logins), 1)
+        self.assertEqual(str(first.exception), str(second.exception))
+        self.assertIn("/session", str(first.exception))
+
+    def test_login_is_retried_after_the_pause(self):
+        self._login(AntiBotChallenge("homepage challenged"))
+        with self.assertRaises(AntiBotChallenge):
+            self.mod.authenticate(None, self.config)
+        self.mod._login_pause = (0.0, self.mod._login_pause[1])
+        self._login(None)
+        self.mod.authenticate(None, self.config)
+        self.assertEqual(len(self.logins), 2)
+        self.assertIsNone(self.mod._login_pause)
+
+    def test_valid_session_is_used_during_the_pause(self):
+        self.mod._login_pause = (float("inf"), "paused")
+        self.mod.verify_imported_session = lambda page, config: None
+        self._login(None)
+        self.mod.authenticate(None, self.config)
+        self.assertEqual(self.logins, [])
+
+
+class SaveSessionTests(unittest.TestCase):
+    def test_refreshed_cookies_replace_the_file_privately(self):
+        import bahamut_auto_bump as mod
+
+        class Context:
+            def storage_state(self):
+                return {"cookies": [{"name": "BAHARUNE", "value": "new"}], "origins": []}
+
+        page = type("Page", (), {"context": Context()})()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "session.json"
+            path.write_text('{"cookies": []}', encoding="utf-8")
+            mod._save_session(page, {"browser": {"storage_state": str(path)}})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["cookies"][0]["value"], "new")
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual([item.name for item in Path(tmp).iterdir()], ["session.json"])
+
 
 if __name__ == "__main__":
     unittest.main()

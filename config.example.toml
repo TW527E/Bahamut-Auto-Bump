@@ -38,6 +38,9 @@ navigation_timeout_ms = 30000
 navigation_interval_seconds = 3
 rate_limit_wait_seconds = 60
 rate_limit_retries = 3
+# After Cloudflare challenges the homepage login, stop retrying that login for
+# this long; the session is still checked on every retry.
+challenge_login_pause_seconds = 21600
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"

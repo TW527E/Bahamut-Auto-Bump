@@ -6,7 +6,19 @@ Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特�
 
 巴哈姆特會對短時間大量請求回應 HTTP 429「系統維修中｜請關閉頁面後稍後再試」，這頁沒有文章也沒有站方訊息。腳本每次換頁至少間隔 `browser.navigation_interval_seconds`（預設 3 秒），遇到 429 會等待 `rate_limit_wait_seconds`（預設 60 秒，每次重試遞增）後重試最多 `rate_limit_retries` 次，仍被限制才回報錯誤；長文章的完整掃描因此會花上數分鐘。
 
-若日誌顯示頁面標題為 `請稍候...` 或 `Just a moment...`，這是巴哈/上游反爬驗證阻擋 headless Chrome，不是 selector 錯誤。程式會安全跳過並重試，不會繞過 CAPTCHA 或瀏覽器挑戰；請先確認主機 IP、瀏覽器依賴與站方存取權限。
+若日誌顯示 `Bahamut anti-bot challenge (Cloudflare)`，代表 Cloudflare 對這台主機的 IP 回應了驗證頁（HTTP 標頭 `cf-mitigated: challenge`；頁面標題先是 `巴哈姆特電玩資訊站 - 系統異常回報`，驗證腳本載入後變成 `請稍候...`），不是 selector 錯誤。程式不會繞過 CAPTCHA 或瀏覽器挑戰。首頁登入被擋下後，會暫停 `browser.challenge_login_pause_seconds`（預設 21600 秒）不再嘗試首頁登入，避免每次重試都讓 IP 持續被標記；這段期間仍會照常檢查 session，用 `/session` 上傳新的 session 後下次重試就會使用。
+
+每次 session 驗證成功或首頁登入成功，都會把瀏覽器目前的 Cookie 寫回 `storage_state`，讓巴哈輪替後的登入 Cookie 持續保存在檔案中。
+
+要確認主機看到的是什麼，可停止服務後執行 `diagnose_access.py`。它會用服務的設定分別以純 HTTP、帶 session 的 Chrome 與不帶 session 的 Chrome 開啟文章與首頁，把報告、截圖與 HTML 存到 `diagnostics/`（不會寫出 Cookie 值或密碼）：
+
+```bash
+sudo systemctl stop bahamut-auto-bump
+cd /opt/Bahamut-Auto-Bump && sudo -u bahamut-bump .venv/bin/python diagnose_access.py --config config.toml
+sudo systemctl start bahamut-auto-bump
+```
+
+純 HTTP 也拿到 `cf-mitigated: challenge` 表示主機 IP 被擋；只有 headless Chrome 被擋時可加 `--headed` 並以 `xvfb-run -a` 執行，比較一般 Chrome 是否能通過。
 
 若伺服器已能正常使用帳密登入，可在設定檔提供帳號資料；也可以在有圖形介面與正常瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
 
