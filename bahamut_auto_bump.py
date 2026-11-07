@@ -8,6 +8,7 @@ import fcntl
 import json
 import logging
 import os
+import random
 import re
 import sys
 import time
@@ -135,10 +136,24 @@ RATE_LIMIT_TITLE = "系統維修中"
 _last_navigation = 0.0
 
 
+def _jittered_seconds(base: float, jitter: float) -> float:
+    """Base interval plus uniform jitter, so requests do not land on a fixed grid.
+
+    A fixed 3.0-second gap between every page load is an easy bot tell; a
+    3-5 second spread is not. Negative inputs are clamped, not rejected.
+    """
+    base = max(0.0, float(base))
+    jitter = max(0.0, float(jitter))
+    return base + (random.uniform(0.0, jitter) if jitter > 0 else 0.0)
+
+
 def _pace(config: dict[str, Any]) -> None:
     """Keep requests to Bahamut at least navigation_interval_seconds apart."""
     global _last_navigation
-    interval = float(config["browser"].get("navigation_interval_seconds", 3))
+    interval = _jittered_seconds(
+        float(config["browser"].get("navigation_interval_seconds", 3)),
+        float(config["browser"].get("navigation_jitter_seconds", 2)),
+    )
     wait = _last_navigation + interval - time.monotonic()
     if wait > 0:
         time.sleep(wait)
@@ -176,7 +191,7 @@ def _challenge_error(page: Any, where: str) -> AntiBotChallenge:
     except Exception:
         title = ""
     return AntiBotChallenge(
-        f"Bahamut anti-bot challenge (Cloudflare) blocked {where}; this host's IP is being challenged; "
+        f"Bahamut anti-bot challenge (Cloudflare) blocked {where}; the IP Chrome browses from is being challenged; "
         f"title={title!r}"
     )
 
@@ -280,13 +295,140 @@ def _thread_page_urls(page: Any, config: dict[str, Any]) -> list[str]:
     return urls
 
 
-def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
-    """Load all thread pages and collect only data needed for safe cleanup."""
+def _read_current_page_posts(page: Any, config: dict[str, Any], *, first_page: bool = False) -> list[PostInfo]:
+    """Read the posts on the currently loaded thread page.
+
+    Returns an empty list for a confirmed empty page (Bahamut can retain
+    sparse page numbers after mass deletion); raises CannotConfirm for
+    anything that is not a readable thread page.
+    """
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     time_selector = str(config["selectors"].get("post_time_selector", ".edittime"))
     content_selector = str(config["selectors"].get("post_content_selector", ".c-article__content"))
     template = str(config["thread"].get("content_template", DEFAULT_TEMPLATE))
+    try:
+        posts_locator = page.locator(selector)
+        if posts_locator.count() == 0:
+            # After mass deletion Bahamut can retain sparse page numbers:
+            # page 2 may be empty while pages 14 and 16 still contain old
+            # replies. Skip a confirmed empty thread page and keep scanning.
+            title = page.title()
+            if _challenged(page):
+                raise _challenge_error(page, "the thread scan")
+            if page.locator("#BH-master").count() == 0:
+                raise CannotConfirm(f"Thread page layout is missing at {page.url}; title={title!r}")
+            page_number = urllib.parse.parse_qs(urllib.parse.urlparse(str(page.url)).query).get("page", ["?"])[0]
+            LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
+            return []
+        posts_locator.first.wait_for(state="attached", timeout=timeout)
+        rows = page.locator("section[id^='post_']").evaluate_all(
+            """
+            (sections, {timeSelector, contentSelector}) => sections.map((section) => {
+              const floorLink = Array.from(section.querySelectorAll('a')).find(a => /\\d+\\s*樓/.test((a.textContent || '').trim()));
+              // The section also contains data-tippy attributes for GP/BP
+              // counters; only the option-menu metadata includes owner.
+              const menu = section.querySelector('button.tippy-option-menu') || section.querySelector('[data-tippy]');
+              let meta = {};
+              try { meta = JSON.parse(menu?.getAttribute('data-tippy') || '{}'); } catch (_) {}
+              const time = section.querySelector(timeSelector) || section.querySelector('time[datetime], .edittime');
+              return {
+                floor: (floorLink?.textContent || '').match(/(\\d+)\\s*樓/)?.[1] || '',
+                sn: String(meta.sn || section.id.replace(/^post_/, '')),
+                owner: meta.owner === true,
+                raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || '',
+                text: section.querySelector(contentSelector)?.innerText || ''
+              };
+            }).filter(item => item.sn)
+            """,
+            {"timeSelector": time_selector, "contentSelector": content_selector},
+        )
+    except CannotConfirm:
+        raise
+    except Exception as exc:
+        try:
+            title = page.title()
+            url = page.url
+        except Exception:
+            title, url = "<unavailable>", "<unavailable>"
+        raise CannotConfirm(f"Could not inspect post layout; url={url!r}, title={title!r}: {exc}") from exc
+    result: list[PostInfo] = []
+    for row in rows:
+        try:
+            floor = int(row["floor"] or (1 if first_page and not result else 0))
+        except (TypeError, ValueError):
+            floor = 0
+        if floor <= 0:
+            raise CannotConfirm(f"Could not determine floor for post {row.get('sn')}")
+        if not row.get("raw"):
+            raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
+        if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
+            raise CannotConfirm("Could not determine a valid post number")
+        result.append(PostInfo(
+            floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), is_bump_text(str(row["text"]), template),
+        ))
+    return result
+
+
+def _should_skip_page(index: int, last_number: int, seen: set[int], skip_seen: bool) -> bool:
+    """True when a page was already read and is not needed again.
+
+    The last page is never skipped: new replies always land there. Any other
+    page is frozen unless a post on it is deleted, and deletions are tracked
+    by post number (sn), not by page, so skipping a seen page cannot change
+    any decision the daily check or the bump verification makes.
+    """
+    return bool(skip_seen and index != last_number and index in seen)
+
+
+def _thread_page_url(config: dict[str, Any], number: int) -> str:
+    """Thread URL for one page number."""
+    parsed = urllib.parse.urlparse(str(config["thread"]["url"]))
+    query = urllib.parse.parse_qs(parsed.query)
+    query["page"] = [str(number)]
+    return urllib.parse.urlunparse(parsed._replace(query=urllib.parse.urlencode(query, doseq=True)))
+
+
+def _reload_last_page(page: Any, config: dict[str, Any], state: dict[str, Any]) -> list[PostInfo]:
+    """Force a fresh load of the last thread page and return its posts.
+
+    Used for the re-check right before submitting, so a bump posted by
+    someone else in the meantime is not duplicated. The cached last page
+    number may be stale when the thread grew, so the pagination on the
+    loaded page is checked and the true last page is loaded instead.
+    """
+    try:
+        number = max(1, int(state.get("last_page") or 1))
+    except (TypeError, ValueError):
+        number = 1
+    _goto(page, _thread_page_url(config, number), config)
+    posts = _read_current_page_posts(page, config, first_page=(number == 1))
+    actual_last = len(_thread_page_urls(page, config))
+    if actual_last != number:
+        number = actual_last
+        _goto(page, _thread_page_url(config, number), config)
+        posts = _read_current_page_posts(page, config, first_page=(number == 1))
+    if not posts:
+        raise CannotConfirm("The last thread page contains no posts")
+    seen = {int(n) for n in (state.get("seen_pages") or []) if str(n).isdigit()}
+    seen.add(number)
+    state["seen_pages"] = sorted(seen)
+    state["last_page"] = number
+    return sorted(posts, key=lambda post: post.floor)
+
+
+def collect_posts(page: Any, config: dict[str, Any], state: dict[str, Any] | None = None, *, skip_seen: bool = False) -> list[PostInfo]:
+    """Load thread pages and collect only data needed for safe cleanup.
+
+    With skip_seen, pages already recorded in state["seen_pages"] are not
+    loaded again, except the last page, which is always re-read. That is what
+    the daily check and the bump verification use: they only ever need the
+    newest page, so a routine check costs 1-2 page loads instead of a full
+    thread scan. A full inventory build passes skip_seen=False so every page
+    is read once and recorded. `state` may be None for a one-off scan.
+    """
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
+    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
     page.set_default_timeout(timeout)
     try:
         configured = urllib.parse.urlparse(str(config["thread"]["url"]))
@@ -312,69 +454,24 @@ def collect_posts(page: Any, config: dict[str, Any]) -> list[PostInfo]:
             f"Could not inspect thread pages; url={url!r}, title={title!r}: {exc}"
         ) from exc
 
+    last_number = len(page_urls)
+    seen: set[int] = set()
+    if state is not None:
+        seen = {int(n) for n in (state.get("seen_pages") or []) if str(n).isdigit()}
     result: list[PostInfo] = []
-    for page_url in page_urls:
+    for index, page_url in enumerate(page_urls, start=1):
+        if _should_skip_page(index, last_number, seen, skip_seen):
+            LOG.info("Skipping already-seen thread page %s", index)
+            continue
         if str(page.url) != page_url:
             _goto(page, page_url, config)
-        try:
-            posts_locator = page.locator(selector)
-            if posts_locator.count() == 0:
-                # After mass deletion Bahamut can retain sparse page numbers:
-                # page 2 may be empty while pages 14 and 16 still contain old
-                # replies. Skip a confirmed empty thread page and keep scanning.
-                title = page.title()
-                if _challenged(page):
-                    raise _challenge_error(page, "the thread scan")
-                if page.locator("#BH-master").count() == 0:
-                    raise CannotConfirm(f"Thread page layout is missing at {page_url}; title={title!r}")
-                page_number = urllib.parse.parse_qs(urllib.parse.urlparse(page_url).query).get("page", ["?"])[0]
-                LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
-                continue
-            posts_locator.first.wait_for(state="attached", timeout=timeout)
-            rows = page.locator("section[id^='post_']").evaluate_all(
-                """
-                (sections, {timeSelector, contentSelector}) => sections.map((section) => {
-                  const floorLink = Array.from(section.querySelectorAll('a')).find(a => /\\d+\\s*樓/.test((a.textContent || '').trim()));
-                  // The section also contains data-tippy attributes for GP/BP
-                  // counters; only the option-menu metadata includes owner.
-                  const menu = section.querySelector('button.tippy-option-menu') || section.querySelector('[data-tippy]');
-                  let meta = {};
-                  try { meta = JSON.parse(menu?.getAttribute('data-tippy') || '{}'); } catch (_) {}
-                  const time = section.querySelector(timeSelector) || section.querySelector('time[datetime], .edittime');
-                  return {
-                    floor: (floorLink?.textContent || '').match(/(\\d+)\\s*樓/)?.[1] || '',
-                    sn: String(meta.sn || section.id.replace(/^post_/, '')),
-                    owner: meta.owner === true,
-                    raw: time?.getAttribute('datetime') || time?.getAttribute('data-mtime') || time?.textContent?.trim() || '',
-                    text: section.querySelector(contentSelector)?.innerText || ''
-                  };
-                }).filter(item => item.sn)
-                """,
-                {"timeSelector": time_selector, "contentSelector": content_selector},
-            )
-        except CannotConfirm:
-            raise
-        except Exception as exc:
-            try:
-                title = page.title()
-                url = page.url
-            except Exception:
-                title, url = "<unavailable>", "<unavailable>"
-            raise CannotConfirm(f"Could not inspect post layout; url={url!r}, title={title!r}: {exc}") from exc
-        for row in rows:
-            try:
-                floor = int(row["floor"] or (1 if not result else 0))
-            except (TypeError, ValueError):
-                floor = 0
-            if floor <= 0:
-                raise CannotConfirm(f"Could not determine floor for post {row.get('sn')}")
-            if not row.get("raw"):
-                raise CannotConfirm(f"Post {row.get('sn')} has no readable timestamp")
-            if not re.fullmatch(r"[0-9]+", str(row["sn"])) or int(row["sn"]) <= 0:
-                raise CannotConfirm("Could not determine a valid post number")
-            result.append(PostInfo(
-                floor, str(row["sn"]), bool(row["owner"]), str(row["raw"]), is_bump_text(str(row["text"]), template),
-            ))
+        page_posts = _read_current_page_posts(page, config, first_page=(index == 1))
+        if state is not None and page_posts:
+            seen.add(index)
+        result.extend(page_posts)
+    if state is not None:
+        state["seen_pages"] = sorted(seen)
+        state["last_page"] = last_number
     if not result:
         raise CannotConfirm("No posts were found for cleanup")
     return sorted({post.sn: post for post in result}.values(), key=lambda post: post.floor)
@@ -481,6 +578,18 @@ def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> No
         )
 
 
+def _previous_page_posts(page: Any, config: dict[str, Any], state: dict[str, Any]) -> list[PostInfo]:
+    """Posts on the page before the recorded last page, or none for a one-page thread."""
+    try:
+        number = int(state.get("last_page") or 0) - 1
+    except (TypeError, ValueError):
+        return []
+    if number < 1:
+        return []
+    _goto(page, _thread_page_url(config, number), config)
+    return _read_current_page_posts(page, config, first_page=(number == 1))
+
+
 def finish_pending_bump(
     page: Any, config: dict[str, Any], state: dict[str, Any], posts: list[PostInfo], now: datetime,
 ) -> bool:
@@ -499,7 +608,14 @@ def finish_pending_bump(
     if "posted_sn" not in pending:
         replies = [post for post in posts if post.owner and post.floor > 1 and int(post.sn) > before_sn]
         if not replies:
-            return False
+            # The new reply may have been pushed off the last page by later
+            # replies; read the page before it before concluding it is missing.
+            # Not a full scan: a submission that did not land (an expired
+            # session, say) ends here on every retry.
+            posts = posts + _previous_page_posts(page, config, state)
+            replies = [post for post in posts if post.owner and post.floor > 1 and int(post.sn) > before_sn]
+            if not replies:
+                return False
         posted = min(replies, key=lambda post: int(post.sn))
         posted_at = parse_post_time(posted.raw_time, now.tzinfo, now)
         if posted_at.date() > now.date():
@@ -508,6 +624,11 @@ def finish_pending_bump(
         pending["posted_date"] = posted_at.date().isoformat()
         write_state(state_path(config), state)
         LOG.info("Confirmed submitted bump sn=%s at %s", posted.sn, posted_at.isoformat())
+        if posted.bump and state.get("bump_inventory") is not None:
+            inventory = state["bump_inventory"]
+            if not any(str(entry.get("sn")) == posted.sn for entry in inventory):
+                inventory.append({"sn": posted.sn, "floor": posted.floor, "date": posted_at.date().isoformat()})
+                write_state(state_path(config), state)
 
     # Clean every older bump, not just the previous one, so a missed day is
     # caught up on the next bump instead of being left behind forever.
@@ -520,7 +641,8 @@ def finish_pending_bump(
             delay = max(5, int(config["cleanup"].get("after_bump_delay_seconds", 5)))
             LOG.info("Waiting %s seconds before cleaning up older bumps", delay)
             time.sleep(delay)
-            cleanup_thread(page, config, posts)
+            _ensure_inventory(page, config, state)
+            cleanup_inventory(page, config, state)
     state["last_confirmed_date"] = pending["posted_date"]
     del state["pending_bump"]
     write_state(state_path(config), state)
@@ -557,6 +679,94 @@ def cleanup_thread(page: Any, config: dict[str, Any], posts: list[PostInfo], max
             LOG.info("Deleted floor %s (sn=%s)", target.floor, target.sn)
         if not dry_run and index + 1 < len(candidates):
             time.sleep(interval)
+    return deleted
+
+
+def _inventory_from_posts(posts: list[PostInfo], config: dict[str, Any]) -> list[dict[str, Any]]:
+    """Own template-matching bump replies as a durable inventory.
+
+    Only replies matching content_template are recorded, so the owner's other
+    replies in the thread are never deleted. The post number (sn) is the
+    stable key; floor labels shift after deletions.
+    """
+    try:
+        tzinfo = ZoneInfo(str(config["schedule"].get("timezone", "Asia/Taipei")))
+    except Exception:
+        tzinfo = ZoneInfo("Asia/Taipei")
+    entries: list[dict[str, Any]] = []
+    for post in posts:
+        if post.floor <= 1 or not post.owner or not post.bump:
+            continue
+        try:
+            posted_date = parse_post_time(post.raw_time, tzinfo).date().isoformat()
+        except CannotConfirm:
+            posted_date = ""
+        entries.append({"sn": str(post.sn), "floor": post.floor, "date": posted_date})
+    return sorted(entries, key=lambda entry: int(entry["sn"]))
+
+
+def _inventory_candidates(inventory: list[dict[str, Any]], keep_latest_replies: int = 1) -> list[dict[str, Any]]:
+    """Inventory bumps older than the retained newest ones, newest sn first."""
+    keep = max(0, int(keep_latest_replies))
+    ordered = sorted(
+        (entry for entry in inventory if str(entry.get("sn", "")).isdigit()),
+        key=lambda entry: int(entry["sn"]),
+        reverse=True,
+    )
+    return ordered[keep:]
+
+
+def _ensure_inventory(page: Any, config: dict[str, Any], state: dict[str, Any]) -> None:
+    """Build the bump inventory with one full scan, the first time it is needed.
+
+    After that the daily flow never scans old pages again: the inventory is
+    maintained from verified bumps and deletions. A missing key means "not
+    built yet"; an empty list means "built, no bumps found".
+    """
+    if state.get("bump_inventory") is not None:
+        return
+    LOG.info("Building the bump inventory with one full thread scan")
+    posts = collect_posts(page, config, state, skip_seen=False)
+    state["bump_inventory"] = _inventory_from_posts(posts, config)
+    write_state(state_path(config), state)
+
+
+def cleanup_inventory(page: Any, config: dict[str, Any], state: dict[str, Any], max_deletions: int = 0) -> int:
+    """Delete older owned bumps from the recorded inventory, without scanning.
+
+    The inventory lists the bot's own template-matching bumps by post number
+    (sn); the newest `keep_latest_replies` are retained and the rest are
+    deleted and verified one by one. A post that is already gone verifies as
+    deleted and is simply dropped from the inventory.
+    """
+    keep = max(1, int(config["cleanup"].get("keep_latest_replies", 1)))
+    candidates = _inventory_candidates(state.get("bump_inventory") or [], keep)
+    if max_deletions > 0:
+        candidates = candidates[:max_deletions]
+    if not candidates:
+        LOG.info("No cleanup candidates; floor 1 and the newest %s bump(s) are retained", keep)
+        return 0
+    dry_run = bool(config["cleanup"].get("dry_run", True))
+    interval = max(5, int(config["cleanup"].get("interval_seconds", 5)))
+    jitter = float(config["browser"].get("navigation_jitter_seconds", 2))
+    deleted = 0
+    for index, target in enumerate(candidates):
+        sn = str(target["sn"])
+        floor = int(target.get("floor", 0))
+        if dry_run:
+            LOG.info("Cleanup dry-run: would delete bump sn=%s (floor %s)", sn, floor)
+        else:
+            post = PostInfo(floor, sn, True, "")
+            delete_post(page, config, post)
+            verify_post_deleted(page, config, post)
+            deleted += 1
+            LOG.info("Deleted bump sn=%s (floor %s)", sn, floor)
+            state["bump_inventory"] = [
+                entry for entry in (state.get("bump_inventory") or []) if str(entry.get("sn")) != sn
+            ]
+            write_state(state_path(config), state)
+        if not dry_run and index + 1 < len(candidates):
+            time.sleep(_jittered_seconds(interval, jitter))
     return deleted
 
 
@@ -779,19 +989,54 @@ def login_from_homepage(page: Any, config: dict[str, Any]) -> None:
     _save_session(page, config)
 
 
-# (monotonic deadline, message) while homepage login is paused after a challenge.
-_login_pause: tuple[float, str] | None = None
+LOGIN_PAUSE_KEY = "login_pause"
+
+
+def _read_login_pause(config: dict[str, Any]) -> dict[str, Any] | None:
+    try:
+        pause = read_state(state_path(config)).get(LOGIN_PAUSE_KEY)
+    except CannotConfirm:
+        return None
+    return pause if isinstance(pause, dict) else None
+
+
+def _write_login_pause(config: dict[str, Any], pause: dict[str, Any] | None) -> None:
+    path = state_path(config)
+    try:
+        state = read_state(path)
+        if pause is None:
+            if LOGIN_PAUSE_KEY not in state:
+                return
+            state.pop(LOGIN_PAUSE_KEY)
+        else:
+            state[LOGIN_PAUSE_KEY] = pause
+        write_state(path, state)
+    except (CannotConfirm, OSError) as exc:
+        LOG.warning("Could not save the homepage login pause to %s: %s", path, exc)
+
+
+def login_pause_seconds(config: dict[str, Any], strikes: int) -> int:
+    """Pause length after the given number of challenged logins in a row.
+
+    The first challenge pauses for challenge_login_pause_seconds and every
+    further one doubles it, up to challenge_login_pause_max_seconds. A flagged
+    IP stays flagged for days, so a fixed pause just meets the same challenge
+    every few hours.
+    """
+    base = max(0, int(config["browser"].get("challenge_login_pause_seconds", 21600)))
+    cap = max(base, int(config["browser"].get("challenge_login_pause_max_seconds", 172800)))
+    return min(cap, base * 2 ** min(max(strikes, 1) - 1, 20))
 
 
 def authenticate(page: Any, config: dict[str, Any]) -> None:
     """Use a valid session first, then fall back to the homepage login flow.
 
     Once Cloudflare challenges the homepage login, retrying it every
-    retry_interval_seconds only keeps the host's IP flagged, so the login is
-    paused for challenge_login_pause_seconds. The session is still checked on
-    every retry, so a fresh one uploaded with /session is used right away.
+    retry_interval_seconds only keeps the IP flagged, so the login is paused
+    (see login_pause_seconds). The pause is kept in state.json so a service
+    restart does not retry right away. The session is still checked on every
+    retry, so a fresh one uploaded with /session is used right away.
     """
-    global _login_pause
     storage_state = str(config["browser"].get("storage_state", "")).strip()
     if storage_state and Path(storage_state).exists():
         try:
@@ -801,16 +1046,25 @@ def authenticate(page: Any, config: dict[str, Any]) -> None:
             raise
         except CannotConfirm as exc:
             LOG.warning("Imported session unavailable; attempting homepage login: %s", exc)
-    if _login_pause and time.monotonic() < _login_pause[0]:
-        raise AntiBotChallenge(_login_pause[1])
+    pause = _read_login_pause(config)
+    now = time.time()
+    if pause and now < float(pause.get("until", 0)):
+        raise AntiBotChallenge(str(pause.get("message") or "Homepage login is paused after a Cloudflare challenge"))
     try:
         login_from_homepage(page, config)
     except AntiBotChallenge as exc:
-        pause = max(0, int(config["browser"].get("challenge_login_pause_seconds", 21600)))
-        message = f"{exc}; homepage login paused for {pause} seconds, upload a fresh session with /session"
-        _login_pause = (time.monotonic() + pause, message)
+        strikes = int(pause.get("strikes", 0)) + 1 if pause else 1
+        seconds = login_pause_seconds(config, strikes)
+        until = now + seconds
+        zone = ZoneInfo(str((config.get("schedule") or {}).get("timezone", "Asia/Taipei")))
+        resume = datetime.fromtimestamp(until, zone).strftime("%m-%d %H:%M")
+        message = (
+            f"{exc}; challenged {strikes} time(s) in a row, homepage login paused for {seconds} seconds "
+            f"(until {resume}); upload a fresh session with /session"
+        )
+        _write_login_pause(config, {"until": until, "strikes": strikes, "message": message})
         raise AntiBotChallenge(message) from exc
-    _login_pause = None
+    _write_login_pause(config, None)
 
 
 def _new_context(browser: Any, config: dict[str, Any], *, use_session: bool = True):
@@ -825,6 +1079,27 @@ def _new_context(browser: Any, config: dict[str, Any], *, use_session: bool = Tr
     return browser.new_context(**options)
 
 
+def browser_proxy(config: dict[str, Any]) -> dict[str, str] | None:
+    """Playwright proxy settings from [browser] proxy, or None to browse directly.
+
+    Cloudflare flags the IP that browses, so routing Chrome through a proxy on
+    another machine (a VPS, for example) keeps this host's own IP out of it.
+    """
+    server = str(config["browser"].get("proxy", "")).strip()
+    if not server:
+        return None
+    if urllib.parse.urlparse(server).scheme not in {"http", "https", "socks5"}:
+        raise ConfigError("[browser] proxy must start with http://, https:// or socks5://")
+    proxy = {"server": server}
+    username = str(config["browser"].get("proxy_username", "")).strip()
+    if username:
+        if server.startswith("socks5://"):
+            raise ConfigError("Chrome cannot authenticate to a socks5 proxy; use an unauthenticated tunnel or an http proxy")
+        proxy["username"] = username
+        proxy["password"] = str(config["browser"].get("proxy_password", ""))
+    return proxy
+
+
 @contextmanager
 def chrome_page(config: dict[str, Any], *, use_session: bool = True):
     """Launch the system Chrome, yield one page, and always close the browser."""
@@ -837,6 +1112,9 @@ def chrome_page(config: dict[str, Any], *, use_session: bool = True):
         launch_options["executable_path"] = str(config["browser"]["executable_path"])
     else:
         launch_options["channel"] = str(config["browser"].get("channel", "chrome"))
+    proxy = browser_proxy(config)
+    if proxy:
+        launch_options["proxy"] = proxy
     with sync_playwright() as playwright:
         browser = None
         try:
@@ -863,16 +1141,12 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     recovered = False
     if "pending_bump" in state:
         LOG.info("Checking the previous unfinished bump before starting another")
-        recovered = finish_pending_bump(page, config, state, collect_posts(page, config), now)
-    _goto(page, str(config["thread"]["url"]), config)
-    page.set_default_timeout(int(config["browser"].get("navigation_timeout_ms", 30000)))
-    selector = str(config["selectors"].get("post_selector", "#BH-master > section[id^='post_'] .c-post"))
-    try:
-        page.locator(selector).first.wait_for(state="attached")
-    except PlaywrightTimeoutError as exc:
-        raise CannotConfirm("Thread posts did not load in time") from exc
-    _navigate_to_last_page(page, config)
-    latest = latest_post_timestamp(page, config, now)
+        recovered = finish_pending_bump(page, config, state, collect_posts(page, config, state, skip_seen=True), now)
+    # Only the last page can tell whether today already has a bump: new
+    # replies always land there. Seen pages are skipped, so this costs one
+    # fresh page load instead of a full thread scan.
+    last_posts = collect_posts(page, config, state, skip_seen=True)
+    latest = parse_post_time(last_posts[-1].raw_time, now.tzinfo, now)
     if is_today(latest, now) or state.get("last_confirmed_date") == now.date().isoformat():
         LOG.info("Today's bump is already present; no additional reply is needed")
         state.pop("pending_bump", None)
@@ -880,18 +1154,19 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         write_state(path, state)
         if not recovered and config["cleanup"].get("enabled", False):
             # A dropped pending bump skipped its cleanup; catch up here.
-            cleanup_thread(page, config, collect_posts(page, config))
+            _ensure_inventory(page, config, state)
+            cleanup_inventory(page, config, state)
         return "recovered" if recovered else "already_done"
 
-    posts = collect_posts(page, config)
+    before_sn = max(int(post.sn) for post in last_posts)
     state["pending_bump"] = {
         "thread_url": str(config["thread"]["url"]),
-        "before_sn": max(int(post.sn) for post in posts),
+        "before_sn": before_sn,
     }
-    _goto(page, str(config["thread"]["url"]), config)
-    page.locator(selector).first.wait_for(state="attached")
-    _navigate_to_last_page(page, config)
-    if is_today(latest_post_timestamp(page, config, now), now):
+    # Fresh re-check right before submitting, so a bump posted by someone else
+    # in the meantime is not duplicated.
+    fresh_posts = _reload_last_page(page, config, state)
+    if is_today(parse_post_time(fresh_posts[-1].raw_time, now.tzinfo, now), now):
         state.pop("pending_bump", None)
         state["last_confirmed_date"] = now.date().isoformat()
         write_state(path, state)
@@ -969,7 +1244,7 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
         time.sleep(wait)
     verification_page = page.context.new_page()
     try:
-        verified_posts = collect_posts(verification_page, config)
+        verified_posts = collect_posts(verification_page, config, state, skip_seen=True)
     finally:
         verification_page.close()
     if not finish_pending_bump(page, config, state, verified_posts, now):
@@ -995,7 +1270,9 @@ def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
     """Run the explicit cleanup command in the same authenticated Chrome session."""
     with bump_lock(config), chrome_page(config) as page:
         authenticate(page, config)
-        return cleanup_thread(page, config, collect_posts(page, config), max_deletions=max_deletions)
+        state = read_state(state_path(config))
+        _ensure_inventory(page, config, state)
+        return cleanup_inventory(page, config, state, max_deletions=max_deletions)
 
 
 def test_imported_session(config: dict[str, Any]) -> None:
@@ -1054,6 +1331,18 @@ def scheduled_datetime(now: datetime, config: dict[str, Any]) -> datetime:
     return datetime.combine(now.date(), dt_time(hour, minute), tzinfo=now.tzinfo)
 
 
+def _day_jitter_seconds(now: datetime, config: dict[str, Any]) -> int:
+    """Per-day random delay for the scheduled run, stable within one day.
+
+    Seeded by the calendar date so the delay does not move while the service
+    waits; a bump landing at the exact same second every day is an easy bot tell.
+    """
+    jitter = max(0, int(config["schedule"].get("schedule_jitter_seconds", 1800)))
+    if jitter <= 0:
+        return 0
+    return int(random.Random(now.date().isoformat()).uniform(0, jitter))
+
+
 TELEGRAM_ALLOWED_HOSTS = {"api.telegram.org"}
 
 
@@ -1105,6 +1394,8 @@ class TelegramNotifier:
         self.offset = int(saved.get("offset", 0))
         self.disabled = set(saved.get("disabled", [])) & NOTIFICATION_TYPES
         self.awaiting_session = bool(saved.get("awaiting_session", False))
+        # Set when /session replaces the session file; run_loop retries at once.
+        self.session_uploaded = False
         self.message_template = str(saved.get("message_template", ""))
         self._register_commands()
 
@@ -1264,6 +1555,7 @@ class TelegramNotifier:
         os.chmod(temporary, 0o600)
         temporary.replace(destination)
         self.awaiting_session = False
+        self.session_uploaded = True
         self._write_state()
 
     def _set_message(self, value: str) -> None:
@@ -1383,10 +1675,23 @@ def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
     deadline = time.monotonic() + seconds
     while True:
         notifier.poll_commands()
+        if notifier.session_uploaded:
+            return
         remaining = int(deadline - time.monotonic())
         if remaining <= 0:
             return
         time.sleep(min(poll_interval, remaining))
+
+
+def notice_reason(reason: str) -> str:
+    """Reduce a failure reason to what stays the same between retries.
+
+    A challenged page alternates between two titles and its message carries
+    pause lengths and times, so the raw text changed between retries and the
+    same Cloudflare block was reported up to three times a day.
+    """
+    reason = re.sub(r"title=(['\"]).*?\1", "title=?", reason)
+    return re.sub(r"\d+", "#", reason)
 
 
 class FailureNotice:
@@ -1402,7 +1707,7 @@ class FailureNotice:
         self.last: tuple[str, str, str] | None = None
 
     def should_send(self, kind: str, reason: str, day: str) -> bool:
-        signature = (day, kind, reason)
+        signature = (day, kind, notice_reason(reason))
         if signature == self.last:
             return False
         self.last = signature
@@ -1412,17 +1717,35 @@ class FailureNotice:
         self.last = None
 
 
+def _retry_delay_seconds(config: dict[str, Any], consecutive_failures: int) -> float:
+    """Retry wait with exponential backoff and jitter.
+
+    Each consecutive failure doubles the wait (up to the cap), so a challenged
+    host IP is not hammered every retry_interval_seconds all day; jitter keeps
+    the retries from landing on a fixed grid.
+    """
+    base = max(30, int(config["schedule"]["retry_interval_seconds"]))
+    cap = max(base, int(config["schedule"].get("retry_backoff_max_seconds", 7200)))
+    jitter = max(0, int(config["schedule"].get("retry_jitter_seconds", 300)))
+    backoff = min(cap, base * (2 ** max(0, consecutive_failures - 1)))
+    return float(backoff) + (random.uniform(0, jitter) if jitter > 0 else 0.0)
+
+
 def run_loop(config: dict[str, Any]) -> None:
-    retry = int(config["schedule"]["retry_interval_seconds"])
     path = state_path(config)
     notifier = TelegramNotifier(config)
     failures = FailureNotice()
+    consecutive_failures = 0
     while True:
         notifier.poll_commands()
+        if notifier.session_uploaded:
+            # A fresh session should not wait out a long retry backoff.
+            notifier.session_uploaded = False
+            consecutive_failures = 0
         now = taiwan_now(config)
         try:
             state = read_state(path)
-            due = scheduled_datetime(now, config)
+            due = scheduled_datetime(now, config) + timedelta(seconds=_day_jitter_seconds(now, config))
             if state.get("last_confirmed_date") == now.date().isoformat() and "pending_bump" not in state:
                 tomorrow = due + timedelta(days=1)
                 sleep_for = max(30, int((tomorrow - now).total_seconds()))
@@ -1434,15 +1757,18 @@ def run_loop(config: dict[str, Any]) -> None:
                 continue
             result = run_once(notifier.configured(config))
             failures.reset()
+            consecutive_failures = 0
             if result in {"posted", "recovered"}:
                 message = "巴哈姆特頂文成功" if result == "posted" else "巴哈姆特上次頂文與清理已補完"
                 notifier.send("success", f"{message}\n文章：{config['thread']['url']}\n時間：{now.strftime('%Y-%m-%d %H:%M:%S UTC+8')}")
         except Exception as exc:
-            LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, retry)
+            consecutive_failures += 1
+            delay = _retry_delay_seconds(config, consecutive_failures)
+            LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, int(delay))
             kind = notification_kind(exc)
             if failures.should_send(kind, str(exc), now.date().isoformat()):
-                notifier.send(kind, f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{kind}\n原因：{exc}\n（同樣的問題今天不再重複通知，服務仍會每 {retry} 秒重試）")
-            sleep_with_telegram(retry, notifier)
+                notifier.send(kind, f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{kind}\n原因：{exc}\n（同樣的問題今天不再重複通知，服務仍會重試，下次約 {int(delay)} 秒後）")
+            sleep_with_telegram(int(delay), notifier)
 
 
 def main() -> int:
