@@ -82,7 +82,7 @@ sudo -u bahamut-bump .venv/bin/python bahamut_auto_bump.py --config config.toml 
 - 驗證結果綁定 IP 與瀏覽器，所以必須在服務主機上、用服務的出口 IP 操作（設定了 `browser.proxy` 時視窗也會走同一個代理）。在別台電腦通過驗證再搬 Cookie 過來沒有用。
 - 請用 `headless = false`。headless Chrome 的 User-Agent 是 `HeadlessChrome`，和你親自驗證的不是同一個瀏覽器。沒有螢幕的伺服器請安裝 Xvfb，並把 systemd 的 `ExecStart` 改為 `xvfb-run -a /opt/Bahamut-Auto-Bump/.venv/bin/python ...`；`--manual-login` 需要看得到視窗，可用 `ssh -X` 或 VNC。
 - 最穩定的環境是家用網路上、偶爾能開視窗的機器（桌機、迷你主機）。機房／VPS 的 IP 本身就容易被驗證。
-- 設定了 `user_data_dir` 時，`storage_state` 檔案只在設定檔未登入、且檔案比上次匯入新（例如用 `/session` 上傳）時才匯入。設定檔目錄含登入 Cookie，權限為 700，不可提交 Git。
+- 設定了 `user_data_dir` 時，`storage_state` 檔案只在設定檔未登入時匯入（Chrome 關閉時會丟掉沒有期限的 Cookie，所以每次驗證成功都會把 Cookie 寫回檔案，下次需要時再匯入）；匯入後仍未登入的檔案會被略過，直到換上新檔案（例如用 `/session` 上傳）。設定檔目錄含登入 Cookie，權限為 700，不可提交 Git。
 
 每次 session 驗證成功或首頁登入成功，都會把瀏覽器目前的 Cookie 寫回 `storage_state`，讓巴哈輪替後的登入 Cookie 持續保存在檔案中。
 

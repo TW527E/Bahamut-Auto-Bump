@@ -832,47 +832,69 @@ def profile_dir(config: dict[str, Any]) -> str:
     return str(config["browser"].get("user_data_dir", "")).strip()
 
 
-PROFILE_IMPORT_MARKER = "bahamut-session-imported"
+PROFILE_REJECTED_MARKER = "bahamut-session-rejected"
 
 
-def _import_session_file(page: Any, config: dict[str, Any]) -> bool:
-    """Load a storage_state file into the Chrome profile, once per file version.
-
-    With a profile the cookies live in the profile, so the file only matters
-    when it is newer than the last import (a /session upload, for example).
-    Returns True when cookies were added and the session is worth re-checking.
-    """
+def _session_file_stamp(config: dict[str, Any]) -> tuple[Path, str] | None:
+    """Marker path and current version stamp of the storage_state file, if both apply."""
     storage_state = str(config["browser"].get("storage_state", "")).strip()
     profile = profile_dir(config)
     if not storage_state or not profile:
-        return False
-    path = Path(storage_state)
-    marker = Path(profile) / PROFILE_IMPORT_MARKER
+        return None
     try:
-        stamp = str(path.stat().st_mtime_ns)
+        stamp = str(Path(storage_state).stat().st_mtime_ns)
     except OSError:
+        return None
+    return Path(profile) / PROFILE_REJECTED_MARKER, stamp
+
+
+def _import_session_file(page: Any, config: dict[str, Any]) -> bool:
+    """Load the storage_state file's cookies into the signed-out Chrome profile.
+
+    Chrome drops session cookies (no expiry) when it closes, so a profile can
+    come back signed out while the file still holds a usable login; the file
+    is therefore imported again on every such run. Only a file version that
+    was imported and still left the profile signed out is skipped.
+    Returns True when cookies were added and the session is worth re-checking.
+    """
+    found = _session_file_stamp(config)
+    if not found:
         return False
+    marker, stamp = found
+    storage_state = str(config["browser"]["storage_state"]).strip()
     try:
         if marker.read_text(encoding="utf-8").strip() == stamp:
             return False
     except OSError:
         pass
     try:
-        cookies = json.loads(path.read_text(encoding="utf-8"))["cookies"]
+        cookies = json.loads(Path(storage_state).read_text(encoding="utf-8"))["cookies"]
         page.context.add_cookies(cookies)
     except Exception as exc:
         LOG.warning("Could not import %s into the Chrome profile: %s", storage_state, exc)
         return False
-    try:
-        marker.write_text(stamp, encoding="utf-8")
-    except OSError as exc:
-        LOG.warning("Could not record the session import in %s: %s", marker, exc)
     LOG.info("Imported cookies from %s into the Chrome profile", storage_state)
     return True
 
 
+def _reject_session_file(config: dict[str, Any]) -> None:
+    """Remember that this version of the storage_state file does not sign in."""
+    found = _session_file_stamp(config)
+    if not found:
+        return
+    marker, stamp = found
+    try:
+        marker.write_text(stamp, encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("Could not record the rejected session in %s: %s", marker, exc)
+
+
 def verify_profile_session(page: Any, config: dict[str, Any]) -> None:
-    """Verify the Chrome profile is signed in, importing a newer storage_state first if needed."""
+    """Verify the Chrome profile is signed in, importing the storage_state file if it is not.
+
+    A verified session is written back to the file, so cookies Chrome will
+    drop on exit can be restored on the next run.
+    """
     try:
         _authenticated_thread_page(page, config)
     except (RateLimited, AntiBotChallenge):
@@ -880,8 +902,15 @@ def verify_profile_session(page: Any, config: dict[str, Any]) -> None:
     except CannotConfirm:
         if not _import_session_file(page, config):
             raise
-        _authenticated_thread_page(page, config)
+        try:
+            _authenticated_thread_page(page, config)
+        except (RateLimited, AntiBotChallenge):
+            raise
+        except CannotConfirm:
+            _reject_session_file(config)
+            raise
     LOG.info("Using signed-in Chrome profile: %s", profile_dir(config))
+    _save_session(page, config)
 
 
 def _save_session(page: Any, config: dict[str, Any]) -> None:

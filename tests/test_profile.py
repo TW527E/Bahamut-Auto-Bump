@@ -34,10 +34,13 @@ class ProfileSessionTests(unittest.TestCase):
             "schedule": {"state_file": str(root / "state.json"), "timezone": "Asia/Taipei"},
         }
         self.saved = (mod._authenticated_thread_page, mod.login_from_homepage, mod.verify_imported_session)
+        self.saved_save = mod._save_session
+        mod._save_session = lambda page, config: None
         self.checks = []
 
     def tearDown(self):
         mod._authenticated_thread_page, mod.login_from_homepage, mod.verify_imported_session = self.saved
+        mod._save_session = self.saved_save
         self.tmp.cleanup()
 
     def _thread_check(self, outcomes):
@@ -59,13 +62,24 @@ class ProfileSessionTests(unittest.TestCase):
         self.assertEqual(page.context.added, [])
         self.assertEqual(len(self.checks), 1)
 
-    def test_newer_session_file_is_imported_once(self):
+    def test_working_session_file_is_imported_again_after_restart(self):
+        # Chrome drops session cookies on exit, so the same file must be
+        # usable on the next run, not only the first time it is seen.
+        self.session.write_text(json.dumps({"cookies": [{"name": "a", "expires": -1}]}))
+        for _ in range(2):
+            self._thread_check([CannotConfirm("signed out"), None])
+            page = FakePage()
+            mod.verify_profile_session(page, self.config)
+            self.assertEqual(page.context.added, [[{"name": "a", "expires": -1}]])
+
+    def test_session_file_that_does_not_sign_in_is_skipped_until_replaced(self):
         self.session.write_text(json.dumps({"cookies": [{"name": "a"}]}))
-        self._thread_check([CannotConfirm("expired"), None])
-        page = FakePage()
-        mod.verify_profile_session(page, self.config)
-        self.assertEqual(page.context.added, [[{"name": "a"}]])
-        # Same file again: not re-imported, the expired profile is reported.
+        self._thread_check([CannotConfirm("expired"), CannotConfirm("expired")])
+        first = FakePage()
+        with self.assertRaises(CannotConfirm):
+            mod.verify_profile_session(first, self.config)
+        self.assertEqual(first.context.added, [[{"name": "a"}]])
+        # Same file again: not re-imported, one page load instead of two.
         self._thread_check([CannotConfirm("expired")])
         again = FakePage()
         with self.assertRaises(CannotConfirm):
@@ -78,6 +92,16 @@ class ProfileSessionTests(unittest.TestCase):
         third = FakePage()
         mod.verify_profile_session(third, self.config)
         self.assertEqual(third.context.added, [[{"name": "b"}]])
+
+    def test_challenge_after_import_does_not_reject_the_file(self):
+        self.session.write_text(json.dumps({"cookies": [{"name": "a"}]}))
+        self._thread_check([CannotConfirm("signed out"), AntiBotChallenge("challenged")])
+        with self.assertRaises(AntiBotChallenge):
+            mod.verify_profile_session(FakePage(), self.config)
+        self._thread_check([CannotConfirm("signed out"), None])
+        page = FakePage()
+        mod.verify_profile_session(page, self.config)
+        self.assertEqual(page.context.added, [[{"name": "a"}]])
 
     def test_challenge_is_not_treated_as_signed_out(self):
         self.session.write_text(json.dumps({"cookies": [{"name": "a"}]}))
