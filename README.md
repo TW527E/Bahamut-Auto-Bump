@@ -2,11 +2,23 @@
 
 Linux 上以系統安裝的 Google Chrome Stable 每天檢查指定巴哈姆特文章，並在能確認「最新樓層不是今天」時發送一次頂文。時區固定由設定中的 `Asia/Taipei`（UTC+8）決定。
 
-安全行為：匯入的 Cookie/session 失效、首頁登入失敗、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。腳本會優先使用有效的 Playwright `storage_state`，失效或不存在時才從巴哈姆特首頁右上角登入入口進行帳號、密碼與可選 TOTP 登入；不會直接導向 `login.php`，也不會繞過 CAPTCHA 或站方反爬驗證。
+安全行為：匯入的 Cookie/session 失效、首頁登入失敗、頁面載入逾時、選擇器不匹配、時間無法唯一解析、或發文後無法驗證，全部視為「無法確認」，不會發文，並由常駐服務稍後重試。狀態判斷只使用最新可見文章容器的最後一個發文時間；只要是今天，就不再送出頂文。腳本會優先使用有效的 Playwright `storage_state`，失效或不存在時才從巴哈姆特首頁右上角登入入口進行帳號、密碼與可選 TOTP 登入；不會直接導向 `login.php`。
 
-巴哈姆特會對短時間大量請求回應 HTTP 429「系統維修中｜請關閉頁面後稍後再試」，這頁沒有文章也沒有站方訊息。腳本每次換頁至少間隔 `browser.navigation_interval_seconds`（預設 3 秒），遇到 429 會等待 `rate_limit_wait_seconds`（預設 60 秒，每次重試遞增）後重試最多 `rate_limit_retries` 次，仍被限制才回報錯誤；長文章的完整掃描因此會花上數分鐘。
+巴哈姆特會對短時間大量請求回應 HTTP 429「系統維修中｜請關閉頁面後稍後再試」，這頁沒有文章也沒有站方訊息。腳本每次換頁至少間隔 `browser.navigation_interval_seconds`（預設 3 秒）再加上 0 到 `browser.navigation_jitter_seconds`（預設 2 秒）的隨機時間，遇到 429 會等待 `rate_limit_wait_seconds`（預設 60 秒，每次重試遞增）後重試最多 `rate_limit_retries` 次，仍被限制才回報錯誤。
 
-若日誌顯示 `Bahamut anti-bot challenge (Cloudflare)`，代表 Cloudflare 對這台主機的 IP 回應了驗證頁（HTTP 標頭 `cf-mitigated: challenge`；頁面標題先是 `巴哈姆特電玩資訊站 - 系統異常回報`，驗證腳本載入後變成 `請稍候...`），不是 selector 錯誤。程式不會繞過 CAPTCHA 或瀏覽器挑戰。首頁登入被擋下後，會暫停 `browser.challenge_login_pause_seconds`（預設 21600 秒）不再嘗試首頁登入，避免每次重試都讓 IP 持續被標記；這段期間仍會照常檢查 session，用 `/session` 上傳新的 session 後下次重試就會使用。
+為了減少對巴哈的訪問量，腳本會在 `state.json` 記住讀過哪些分頁（`seen_pages`）與最後一頁的頁碼（`last_page`）。新回覆只會出現在最後一頁，所以每天的檢查、送出前的確認與送出後的驗證都只重讀最後一頁，讀過的其他分頁不會再讀。清理舊頂文改用 `bump_inventory`：一份以文章編號（sn）記錄的自家頂文清單，第一次需要清理時全掃一次建立，之後由驗證成功的新頂文與刪除結果維護，不再重掃整篇文章。一次頂文因此約 6 到 8 次頁面載入，不是原本的四十幾次。
+
+若日誌顯示 `Bahamut anti-bot challenge (Cloudflare)`，代表 Cloudflare 對 Chrome 上網所用的 IP 回應了驗證頁（HTTP 標頭 `cf-mitigated: challenge`；頁面標題先是 `巴哈姆特電玩資訊站 - 系統異常回報`，驗證腳本載入後變成 `請稍候...`），不是 selector 錯誤。首頁登入被擋下後，會暫停 `browser.challenge_login_pause_seconds`（預設 21600 秒）不再嘗試首頁登入，之後每連續再被擋一次暫停時間加倍，最多 `browser.challenge_login_pause_max_seconds`（預設 172800 秒）；首頁登入成功才歸零。暫停狀態存在 `state.json`，重啟服務不會立刻再撞一次。這段期間仍會照常檢查 session，用 `/session` 上傳新的 session 後下次重試就會使用。同一個挑戰不論頁面標題是哪一個、暫停多久，一天只通知一次。
+
+Cloudflare 是依 IP 標記，服務用哪個 IP 上網就是哪個 IP 被標記。若不想讓服務主機（例如家裡）的 IP 被標記，可讓 Chrome 經由另一台機器（例如 VPS）上網：
+
+```toml
+[browser]
+proxy = "socks5://127.0.0.1:1080"   # 例如 ssh -D 1080 -N user@vps 建立的通道
+# 或 http 代理：proxy = "http://vps:3128"，需要帳密時設定 proxy_username／proxy_password
+```
+
+Chrome 不支援需要帳密的 socks5 代理，有帳密時請改用 http 代理。換了出口 IP 後，原本的 session 可能需要在新 IP 上重新登入或用 `/session` 重新上傳。
 
 每次 session 驗證成功或首頁登入成功，都會把瀏覽器目前的 Cookie 寫回 `storage_state`，讓巴哈輪替後的登入 Cookie 持續保存在檔案中。
 
@@ -18,7 +30,7 @@ cd /opt/Bahamut-Auto-Bump && sudo -u bahamut-bump .venv/bin/python diagnose_acce
 sudo systemctl start bahamut-auto-bump
 ```
 
-純 HTTP 也拿到 `cf-mitigated: challenge` 表示主機 IP 被擋；只有 headless Chrome 被擋時可加 `--headed` 並以 `xvfb-run -a` 執行，比較一般 Chrome 是否能通過。
+純 HTTP 也拿到 `cf-mitigated: challenge` 表示 IP 被擋（設定了 http 代理時純 HTTP 也走代理，socks5 代理則是直連，報告的 `plain_http_via` 會註明）；只有 headless Chrome 被擋時可加 `--headed` 並以 `xvfb-run -a` 執行，比較一般 Chrome 是否能通過。
 
 若伺服器已能正常使用帳密登入，可在設定檔提供帳號資料；也可以在有圖形介面與正常瀏覽器的電腦上手動登入並完成站方驗證，再匯出 Playwright session。匯出工具預設使用系統安裝的 Google Chrome Stable，不會下載或使用 Chromium for Testing：
 
@@ -48,9 +60,9 @@ totp_secret = "你的 TOTP Base32 秘密（沒有就留空）"
 homepage_url = "https://www.gamer.com.tw/"
 ```
 
-腳本會先開啟 `homepage_url`。若首頁當天顯示全版封面廣告（只有「進入巴哈姆特 >>」連結），會先點進該連結指向的首頁（`homepage_cover_enter` 選擇器）。若首頁第一次顯示「登入後可從置頂導航搜尋、接收通知與展開個人選單」提示，會先按下 `Close` 關閉，再點擊右上角「登入」，最後填寫登入 iframe 中的欄位；提示不存在時會直接略過。所有登入選擇器（包含 `login_onboarding` 與 `login_onboarding_close`）都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知，不會嘗試繞過驗證。
+腳本會先開啟 `homepage_url`。若首頁當天顯示全版封面廣告（只有「進入巴哈姆特 >>」連結），會先點進該連結指向的首頁（`homepage_cover_enter` 選擇器）。若首頁第一次顯示「登入後可從置頂導航搜尋、接收通知與展開個人選單」提示，會先按下 `Close` 關閉，再點擊右上角「登入」，最後填寫登入 iframe 中的欄位；提示不存在時會直接略過。所有登入選擇器（包含 `login_onboarding` 與 `login_onboarding_close`）都在 `[selectors]`，可依巴哈姆特改版調整。若首頁本身被站方挑戰頁阻擋，腳本會停止並通知。
 
-這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若 VPS 仍看到 `請稍候...`，代表反爬驗證不接受轉移的 session，應改在被允許的網路環境執行，不能靠腳本繞過驗證。
+這個檔案含有登入 Cookie，不能提交 Git 或貼到聊天中。登入 Cookie 可能因 IP、瀏覽器指紋或有效期限而失效；若仍看到 `請稍候...`，代表 Cloudflare 擋的是這個 IP，轉移 session 也沒用，需等 IP 冷卻或改用 `browser.proxy` 換出口 IP。
 
 ## 安裝
 
@@ -133,14 +145,14 @@ systemctl status bahamut-auto-bump.service
 journalctl -u bahamut-auto-bump.service -f
 ```
 
-服務本身會依設定的 `schedule.time` 計算每日執行時間；若當天尚未能安全確認，會依 `retry_interval_seconds` 重試。`state.json` 記錄「今天已確認日期」，並在頂文送出、驗證與刪除舊頂文的過程中保存 `pending_bump` 進度。
+服務本身會依設定的 `schedule.time` 計算每日執行時間，再延後 0 到 `schedule.schedule_jitter_seconds`（預設 1800 秒）的隨機時間（同一天內固定）。若當天尚未能安全確認會重試：第一次等 `retry_interval_seconds`，之後每連續失敗一次加倍，最多 `retry_backoff_max_seconds`（預設 7200 秒），每次再加上 0 到 `retry_jitter_seconds`（預設 300 秒）的隨機時間；成功一次或用 `/session` 上傳新 session 後歸零，上傳後會立刻重試。`state.json` 記錄「今天已確認日期」，並在頂文送出、驗證與刪除舊頂文的過程中保存 `pending_bump` 進度。
 
 ## 自動補完上次未完成的頂文
 
 若上次頂文送出後因逾時、驗證失敗或刪除舊頂文中途出錯而沒有走完，`state.json` 會留下 `pending_bump` 記錄（含發文前最大文章編號）。下次啟動頂文前會先讀取這筆記錄，並在檢查新頂文之前補完：
 
-- 若上次其實已送出成功（出現編號比發文前更大、且屬於本帳號的新回覆），會直接認定為已頂，不會重複發文。
-- 若上次已標記發文成功但刪除舊頂文沒完成，會重新掃描文章，刪除除了最新一筆以外所有符合頂文格式的舊頂文。
+- 若上次其實已送出成功（出現編號比發文前更大、且屬於本帳號的新回覆），會直接認定為已頂，不會重複發文。只會檢查最後一頁與前一頁，不會全掃。
+- 若上次已標記發文成功但刪除舊頂文沒完成，會依 `bump_inventory` 刪除除了最新一筆以外所有符合頂文格式的舊頂文。
 - 只有補完後仍無法確認今天有頂文時，才會送出新的頂文。
 
 整個頂文與清理流程以 `state.json.lock` 檔案鎖互斥，避免常駐服務與手動 `--once`／`--cleanup` 同時操作同一文章。補完成功時會送出「上次頂文與清理已補完」的成功通知。
@@ -165,6 +177,6 @@ Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天�
 
 「今天已經頂過」是例行檢查結果，不會發送通知。Telegram API 連線失敗只寫入 systemd 日誌，避免通知失敗造成無限遞迴。Bot 必須能讀取管理者私聊訊息；若使用群組管理指令，請將該群組 ID 設為 `admin_chat_id`。
 
-`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查會把 `auth` 通知私訊給 `admin_chat_id`。同一種問題（類型與原因都相同）一天只通知一次，服務仍會照 `retry_interval_seconds` 持續重試。
+`/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查會把 `auth` 通知私訊給 `admin_chat_id`。同一種問題（類型與原因相同，比對時忽略頁面標題與數字）一天只通知一次，服務仍會持續重試（間隔見上方 systemd 一節）。
 
 請勿把 `config.toml` 或 `bahamut-session.json` 提交到 Git，也不要分享匯出的 Cookie/session。使用本工具前請確認符合巴哈姆特帳號安全政策與版規。

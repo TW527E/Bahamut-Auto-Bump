@@ -289,8 +289,11 @@ class PendingBumpTests(unittest.TestCase):
         self.assertEqual(page.deleted, [])
 
     def test_catches_up_every_older_bump_only(self):
+        # The first cleanup builds the inventory from one full scan; only own
+        # template-matching replies (70 and 80) are older bumps to delete.
+        import bahamut_auto_bump as mod
         state = {"pending_bump": {"thread_url": self.url, "before_sn": 100}}
-        posts = [
+        all_posts = [
             PostInfo(1, "1", True, "2026-01-01 09:00:00", True),
             PostInfo(2, "70", True, "2026-01-02 09:00:00", True),
             PostInfo(3, "75", True, "2026-01-02 12:00:00", False),
@@ -298,14 +301,48 @@ class PendingBumpTests(unittest.TestCase):
             PostInfo(5, "90", False, "2026-01-04 09:00:00", True),
             PostInfo(6, "150", True, "2026-01-05 09:00:00", True),
         ]
+        scans = []
+        saved = mod.collect_posts
+        mod.collect_posts = lambda page, config, state=None, skip_seen=False: scans.append(skip_seen) or all_posts
+        try:
+            done, page, state = self._run(state, all_posts[-1:], self._config(enabled=True, dry_run=False))
+        finally:
+            mod.collect_posts = saved
+        self.assertTrue(done)
+        self.assertEqual(scans, [False])
+        self.assertEqual(page.deleted, ["80", "70"])
+        self.assertEqual(page.verified, ["80", "70"])
+        self.assertEqual([entry["sn"] for entry in state["bump_inventory"]], ["150"])
+        self.assertNotIn("pending_bump", state)
+
+    def test_existing_inventory_gets_the_new_bump_and_needs_no_scan(self):
+        state = {
+            "pending_bump": {"thread_url": self.url, "before_sn": 100},
+            "bump_inventory": [{"sn": "70", "floor": 2, "date": "2026-01-02"}, {"sn": "80", "floor": 4, "date": "2026-01-03"}],
+        }
+        posts = [PostInfo(6, "150", True, "2026-01-05 09:00:00", True)]
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
         self.assertTrue(done)
         self.assertEqual(page.deleted, ["80", "70"])
-        self.assertEqual(page.verified, ["80", "70"])
-        self.assertNotIn("pending_bump", state)
+        self.assertEqual([entry["sn"] for entry in state["bump_inventory"]], ["150"])
+
+    def test_missing_reply_reads_only_the_previous_page(self):
+        import bahamut_auto_bump as mod
+        state = {"pending_bump": {"thread_url": self.url, "before_sn": 100}, "last_page": 21}
+        loaded = []
+        saved = (mod._goto, mod._read_current_page_posts)
+        mod._goto = lambda page, url, config: loaded.append(url)
+        mod._read_current_page_posts = lambda page, config, first_page=False: [PostInfo(30, "150", True, "2026-01-05 09:00:00", True)]
+        try:
+            done, page, state = self._run(state, [PostInfo(31, "160", False, "2026-01-05 09:10:00")], self._config())
+        finally:
+            mod._goto, mod._read_current_page_posts = saved
+        self.assertTrue(done)
+        self.assertEqual(loaded, [f"{self.url}&page=20"])
 
     def test_dry_run_deletes_nothing(self):
         state = {"pending_bump": {"thread_url": self.url, "before_sn": 100}}
+        state["bump_inventory"] = [{"sn": "80", "floor": 2, "date": "2026-01-04"}]
         posts = [PostInfo(2, "80", True, "2026-01-04 09:00:00", True), PostInfo(3, "150", True, "2026-01-05 09:00:00", True)]
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=True))
         self.assertTrue(done)
@@ -315,6 +352,7 @@ class PendingBumpTests(unittest.TestCase):
         def fail(p, c, post):
             raise CannotConfirm("delete failed")
         state = {"pending_bump": {"thread_url": self.url, "before_sn": 100}}
+        state["bump_inventory"] = [{"sn": "80", "floor": 2, "date": "2026-01-04"}]
         posts = [PostInfo(2, "80", True, "2026-01-04 09:00:00", True), PostInfo(3, "150", True, "2026-01-05 09:00:00", True)]
         with self.assertRaises(CannotConfirm):
             self._run(state, posts, self._config(enabled=True, dry_run=False), delete=fail)
@@ -368,7 +406,7 @@ class RateLimitTests(unittest.TestCase):
         saved = mod.time.sleep
         mod.time.sleep = sleeps.append
         mod._last_navigation = 0.0
-        config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_wait_seconds": 10, "rate_limit_retries": retries}}
+        config = {"browser": {"navigation_interval_seconds": 0, "navigation_jitter_seconds": 0, "rate_limit_wait_seconds": 10, "rate_limit_retries": retries}}
         try:
             mod._goto(page, "https://forum.gamer.com.tw/C.php?bsn=1&snA=2", config)
         finally:
@@ -534,9 +572,8 @@ class LoginPauseTests(unittest.TestCase):
     def setUp(self):
         import bahamut_auto_bump as mod
         self.mod = mod
-        self.saved = (mod.verify_imported_session, mod.login_from_homepage, mod._login_pause)
+        self.saved = (mod.verify_imported_session, mod.login_from_homepage)
         self.logins = []
-        mod._login_pause = None
 
         def expired(page, config):
             raise CannotConfirm("session expired")
@@ -545,10 +582,14 @@ class LoginPauseTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         session = Path(self.tmp.name) / "session.json"
         session.write_text("{}", encoding="utf-8")
-        self.config = {"browser": {"storage_state": str(session), "challenge_login_pause_seconds": 3600}}
+        self.state = Path(self.tmp.name) / "state.json"
+        self.config = {
+            "browser": {"storage_state": str(session), "challenge_login_pause_seconds": 3600},
+            "schedule": {"timezone": "Asia/Taipei", "state_file": str(self.state)},
+        }
 
     def tearDown(self):
-        self.mod.verify_imported_session, self.mod.login_from_homepage, self.mod._login_pause = self.saved
+        self.mod.verify_imported_session, self.mod.login_from_homepage = self.saved
         self.tmp.cleanup()
 
     def _login(self, outcome):
@@ -558,6 +599,14 @@ class LoginPauseTests(unittest.TestCase):
                 raise outcome
 
         self.mod.login_from_homepage = login
+
+    def _pause(self):
+        return read_state(self.state).get("login_pause")
+
+    def _expire_pause(self):
+        state = read_state(self.state)
+        state["login_pause"]["until"] = 0
+        write_state(self.state, state)
 
     def test_challenged_login_is_not_retried_during_the_pause(self):
         self._login(AntiBotChallenge("homepage challenged"))
@@ -569,22 +618,102 @@ class LoginPauseTests(unittest.TestCase):
         self.assertEqual(str(first.exception), str(second.exception))
         self.assertIn("/session", str(first.exception))
 
-    def test_login_is_retried_after_the_pause(self):
+    def test_pause_survives_a_restart_and_keeps_pending_bump(self):
+        write_state(self.state, {"pending_bump": {"before_max_sn": 1}})
         self._login(AntiBotChallenge("homepage challenged"))
         with self.assertRaises(AntiBotChallenge):
             self.mod.authenticate(None, self.config)
-        self.mod._login_pause = (0.0, self.mod._login_pause[1])
+        state = read_state(self.state)
+        self.assertEqual(state["pending_bump"], {"before_max_sn": 1})
+        self.assertEqual(state["login_pause"]["strikes"], 1)
+
+    def test_each_further_challenge_doubles_the_pause_up_to_the_cap(self):
+        self.config["browser"]["challenge_login_pause_max_seconds"] = 10000
+        self._login(AntiBotChallenge("homepage challenged"))
+        lengths = []
+        for _ in range(4):
+            with self.assertRaises(AntiBotChallenge) as ctx:
+                self.mod.authenticate(None, self.config)
+            lengths.append(ctx.exception)
+            self._expire_pause()
+        self.assertEqual(self._pause()["strikes"], 4)
+        self.assertEqual(
+            [self.mod.login_pause_seconds(self.config, n) for n in (1, 2, 3, 4)],
+            [3600, 7200, 10000, 10000],
+        )
+        self.assertIn("paused for 10000 seconds", str(lengths[-1]))
+
+    def test_login_is_retried_after_the_pause_and_success_clears_it(self):
+        self._login(AntiBotChallenge("homepage challenged"))
+        with self.assertRaises(AntiBotChallenge):
+            self.mod.authenticate(None, self.config)
+        self._expire_pause()
         self._login(None)
         self.mod.authenticate(None, self.config)
         self.assertEqual(len(self.logins), 2)
-        self.assertIsNone(self.mod._login_pause)
+        self.assertIsNone(self._pause())
 
     def test_valid_session_is_used_during_the_pause(self):
-        self.mod._login_pause = (float("inf"), "paused")
+        write_state(self.state, {"login_pause": {"until": 9e18, "strikes": 1, "message": "paused"}})
         self.mod.verify_imported_session = lambda page, config: None
         self._login(None)
         self.mod.authenticate(None, self.config)
         self.assertEqual(self.logins, [])
+
+
+class ChallengeNoticeTests(unittest.TestCase):
+    def test_alternating_titles_and_pause_times_are_one_notice(self):
+        from bahamut_auto_bump import FailureNotice
+
+        notice = FailureNotice()
+        base = "blocked www.gamer.com.tw/; title={}; challenged {} time(s) in a row, paused for {} seconds (until {})"
+        self.assertTrue(notice.should_send("auth", base.format("'巴哈姆特電玩資訊站 - 系統異常回報'", 1, 21600, "11-06 22:37"), "2026-11-07"))
+        self.assertFalse(notice.should_send("auth", base.format("'請稍候...'", 2, 43200, "11-07 09:00"), "2026-11-07"))
+        self.assertTrue(notice.should_send("auth", base.format("'請稍候...'", 2, 43200, "11-07 09:00"), "2026-11-08"))
+
+
+class SessionUploadWakeTests(unittest.TestCase):
+    def test_uploaded_session_ends_the_retry_sleep(self):
+        import bahamut_auto_bump as mod
+
+        class Notifier:
+            config = {"telegram": {"poll_interval_seconds": 1}}
+            session_uploaded = False
+            polls = 0
+
+            def poll_commands(self):
+                self.polls += 1
+                if self.polls == 3:
+                    self.session_uploaded = True
+
+        notifier = Notifier()
+        saved = mod.time.sleep
+        mod.time.sleep = lambda seconds: None
+        try:
+            mod.sleep_with_telegram(7200, notifier)
+        finally:
+            mod.time.sleep = saved
+        self.assertEqual(notifier.polls, 3)
+
+
+class BrowserProxyTests(unittest.TestCase):
+    def test_no_proxy_by_default(self):
+        from bahamut_auto_bump import browser_proxy
+
+        self.assertIsNone(browser_proxy({"browser": {}}))
+
+    def test_proxy_with_credentials(self):
+        from bahamut_auto_bump import browser_proxy
+
+        config = {"browser": {"proxy": "http://vps:3128", "proxy_username": "u", "proxy_password": "p"}}
+        self.assertEqual(browser_proxy(config), {"server": "http://vps:3128", "username": "u", "password": "p"})
+
+    def test_bad_proxies_are_rejected(self):
+        from bahamut_auto_bump import ConfigError, browser_proxy
+
+        for browser in ({"proxy": "vps:1080"}, {"proxy": "socks5://vps:1080", "proxy_username": "u"}):
+            with self.subTest(browser=browser), self.assertRaises(ConfigError):
+                browser_proxy({"browser": browser})
 
 
 class SaveSessionTests(unittest.TestCase):

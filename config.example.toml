@@ -36,11 +36,22 @@ navigation_timeout_ms = 30000
 # Bahamut answers request bursts with HTTP 429 "系統維修中". Space page loads
 # apart and wait out the limit (rate_limit_wait_seconds grows per retry).
 navigation_interval_seconds = 3
+# Jitter added on top of navigation_interval_seconds, so page loads land
+# 3-5 seconds apart instead of exactly every 3.0 seconds.
+navigation_jitter_seconds = 2
 rate_limit_wait_seconds = 60
 rate_limit_retries = 3
 # After Cloudflare challenges the homepage login, stop retrying that login for
-# this long; the session is still checked on every retry.
+# this long; each further challenge in a row doubles the pause up to
+# challenge_login_pause_max_seconds. The session is still checked on every retry.
 challenge_login_pause_seconds = 21600
+challenge_login_pause_max_seconds = 172800
+# Optional proxy for Chrome, e.g. "socks5://127.0.0.1:1080" for an SSH tunnel
+# to a VPS (ssh -D 1080 -N user@vps). Cloudflare flags the IP that browses, so
+# this keeps the service host's own IP out of it. Leave empty to browse directly.
+proxy = ""
+# proxy_username = ""
+# proxy_password = ""
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"
@@ -56,6 +67,14 @@ homepage_url = "https://www.gamer.com.tw/"
 timezone = "Asia/Taipei"
 time = "09:00"
 retry_interval_seconds = 900
+# Retry backoff: each consecutive failure doubles the wait (up to the cap),
+# plus uniform jitter. While Cloudflare is challenging the host IP, retrying
+# every 900 seconds only keeps the IP flagged.
+retry_jitter_seconds = 300
+retry_backoff_max_seconds = 7200
+# The daily run is delayed by a per-day random amount (0..this), stable
+# within one day, so the bump does not land at the exact same second daily.
+schedule_jitter_seconds = 1800
 state_file = "state.json"
 
 [cleanup]
