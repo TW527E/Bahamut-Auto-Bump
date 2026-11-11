@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -1438,17 +1439,34 @@ def inspect_and_maybe_bump(page: Any, config: dict[str, Any], now: datetime) -> 
     return "posted"
 
 
+# One browser at a time inside this process. Telegram commands run on their
+# own thread: a scheduled run waits for a test command to finish, while a test
+# command is refused when a run is in progress.
+_BROWSER_BUSY = threading.Lock()
+
+
+@contextmanager
+def _browser_for_command():
+    if not _BROWSER_BUSY.acquire(blocking=False):
+        raise CannotConfirm("頂文或清理正在執行中，請稍後再試")
+    try:
+        yield
+    finally:
+        _BROWSER_BUSY.release()
+
+
 def run_once(config: dict[str, Any]) -> str:
-    now = taiwan_now(config)
-    LOG.info("Checking %s at %s", config["thread"]["url"], now.isoformat())
-    with bump_lock(config), chrome_page(config) as page:
-        authenticate(page, config)
-        return inspect_and_maybe_bump(page, config, now)
+    with _BROWSER_BUSY:
+        now = taiwan_now(config)
+        LOG.info("Checking %s at %s", config["thread"]["url"], now.isoformat())
+        with bump_lock(config), chrome_page(config) as page:
+            authenticate(page, config)
+            return inspect_and_maybe_bump(page, config, now)
 
 
 def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
     """Run the explicit cleanup command in the same authenticated Chrome session."""
-    with bump_lock(config), chrome_page(config) as page:
+    with _BROWSER_BUSY, bump_lock(config), chrome_page(config) as page:
         authenticate(page, config)
         state = read_state(state_path(config))
         _ensure_inventory(page, config, state)
@@ -1457,7 +1475,7 @@ def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
 
 def test_imported_session(config: dict[str, Any]) -> None:
     """Open Chrome with the profile or imported storage state and verify authentication only."""
-    with bump_lock(config), chrome_page(config) as page:
+    with _browser_for_command(), bump_lock(config), chrome_page(config) as page:
         if profile_dir(config):
             verify_profile_session(page, config)
         else:
@@ -1466,7 +1484,7 @@ def test_imported_session(config: dict[str, Any]) -> None:
 
 def test_automatic_login(config: dict[str, Any]) -> None:
     """Force a clean homepage login test without relying on an imported session."""
-    with chrome_page(config, use_session=False) as page:
+    with _browser_for_command(), chrome_page(config, use_session=False) as page:
         login_from_homepage(page, config)
 
 
@@ -1578,7 +1596,7 @@ class TelegramNotifier:
         self.disabled = set(saved.get("disabled", [])) & NOTIFICATION_TYPES
         self.awaiting_session = bool(saved.get("awaiting_session", False))
         # Set when /session replaces the session file; run_loop retries at once.
-        self.session_uploaded = False
+        self.session_uploaded = threading.Event()
         self.message_template = str(saved.get("message_template", ""))
         self._register_commands()
 
@@ -1738,7 +1756,7 @@ class TelegramNotifier:
         os.chmod(temporary, 0o600)
         temporary.replace(destination)
         self.awaiting_session = False
-        self.session_uploaded = True
+        self.session_uploaded.set()
         self._write_state()
 
     def _set_message(self, value: str) -> None:
@@ -1766,6 +1784,27 @@ class TelegramNotifier:
         values = dict(config)
         values["thread"] = thread
         return values
+
+    def start_polling(self) -> threading.Thread:
+        """Handle Telegram commands on a background thread.
+
+        Commands used to be polled between browser runs, so they went
+        unanswered while a bump, a cleanup or a rate-limit wait was in
+        progress. Only this thread writes the Telegram state file.
+        """
+        interval = max(1, int(self.config["telegram"].get("poll_interval_seconds", 2)))
+
+        def loop() -> None:
+            while True:
+                try:
+                    self.poll_commands()
+                except Exception:
+                    LOG.exception("Telegram command handling failed; polling continues")
+                time.sleep(interval)
+
+        thread = threading.Thread(target=loop, name="telegram-poll", daemon=True)
+        thread.start()
+        return thread
 
     def poll_commands(self) -> None:
         try:
@@ -1854,16 +1893,11 @@ def notification_kind(exc: Exception) -> str:
 
 
 def sleep_with_telegram(seconds: int, notifier: TelegramNotifier) -> None:
-    poll_interval = max(1, int(notifier.config["telegram"].get("poll_interval_seconds", 2)))
-    deadline = time.monotonic() + seconds
-    while True:
-        notifier.poll_commands()
-        if notifier.session_uploaded:
-            return
-        remaining = int(deadline - time.monotonic())
-        if remaining <= 0:
-            return
-        time.sleep(min(poll_interval, remaining))
+    """Wait for the next check, returning early when /session uploads a new session.
+
+    Telegram commands are handled by the polling thread, not here.
+    """
+    notifier.session_uploaded.wait(max(0, seconds))
 
 
 def notice_reason(reason: str) -> str:
@@ -1919,11 +1953,11 @@ def run_loop(config: dict[str, Any]) -> None:
     notifier = TelegramNotifier(config)
     failures = FailureNotice()
     consecutive_failures = 0
+    notifier.start_polling()
     while True:
-        notifier.poll_commands()
-        if notifier.session_uploaded:
+        if notifier.session_uploaded.is_set():
             # A fresh session should not wait out a long retry backoff.
-            notifier.session_uploaded = False
+            notifier.session_uploaded.clear()
             consecutive_failures = 0
         now = taiwan_now(config)
         try:

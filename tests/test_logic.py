@@ -674,26 +674,76 @@ class ChallengeNoticeTests(unittest.TestCase):
 
 class SessionUploadWakeTests(unittest.TestCase):
     def test_uploaded_session_ends_the_retry_sleep(self):
+        import threading
+        import time
         import bahamut_auto_bump as mod
 
         class Notifier:
-            config = {"telegram": {"poll_interval_seconds": 1}}
-            session_uploaded = False
-            polls = 0
-
-            def poll_commands(self):
-                self.polls += 1
-                if self.polls == 3:
-                    self.session_uploaded = True
+            session_uploaded = threading.Event()
 
         notifier = Notifier()
-        saved = mod.time.sleep
-        mod.time.sleep = lambda seconds: None
+        threading.Timer(0.05, notifier.session_uploaded.set).start()
+        started = time.monotonic()
+        mod.sleep_with_telegram(30, notifier)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_sleep_ends_at_the_deadline_without_an_upload(self):
+        import threading
+        import time
+        import bahamut_auto_bump as mod
+
+        class Notifier:
+            session_uploaded = threading.Event()
+
+        started = time.monotonic()
+        mod.sleep_with_telegram(0.05, Notifier())
+        self.assertGreaterEqual(time.monotonic() - started, 0.04)
+
+
+class CommandThreadTests(unittest.TestCase):
+    def test_test_commands_are_refused_while_a_run_holds_the_browser(self):
+        import bahamut_auto_bump as mod
+
+        def no_browser(*args, **kwargs):
+            raise AssertionError("Chrome must not start while a run is in progress")
+
+        saved = mod.chrome_page
+        mod.chrome_page = no_browser
         try:
-            mod.sleep_with_telegram(7200, notifier)
+            with mod._BROWSER_BUSY:
+                with self.assertRaises(CannotConfirm):
+                    mod.test_automatic_login({})
+                with self.assertRaises(CannotConfirm):
+                    mod.test_imported_session({})
+        finally:
+            mod.chrome_page = saved
+        self.assertFalse(mod._BROWSER_BUSY.locked())
+
+    def test_polling_thread_survives_a_failing_command(self):
+        import threading
+        import bahamut_auto_bump as mod
+
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.config = {"telegram": {"poll_interval_seconds": 1}}
+        calls = []
+        third = threading.Event()
+
+        def poll():
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("boom")
+            if len(calls) >= 3:
+                third.set()
+
+        notifier.poll_commands = poll
+        saved = mod.time.sleep
+        mod.time.sleep = lambda seconds: saved(0.001)
+        try:
+            thread = notifier.start_polling()
+            self.assertTrue(third.wait(5))
         finally:
             mod.time.sleep = saved
-        self.assertEqual(notifier.polls, 3)
+        self.assertTrue(thread.daemon)
 
 
 class BrowserProxyTests(unittest.TestCase):
