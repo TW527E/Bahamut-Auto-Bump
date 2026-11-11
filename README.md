@@ -18,7 +18,71 @@ proxy = "socks5://127.0.0.1:1080"   # 例如 ssh -D 1080 -N user@vps 建立的�
 # 或 http 代理：proxy = "http://vps:3128"，需要帳密時設定 proxy_username／proxy_password
 ```
 
+### 範例：經 Tailscale 從家裡的 OpenWrt 路由器上網
+
+伺服器和家裡的 OpenWrt 路由器都在同一個 Tailscale 網路時，可以在路由器上跑 tinyproxy，讓伺服器的 Chrome 從家裡的 IP 上網。只有 Chrome 的流量會經過家裡，Telegram 與伺服器其他流量不變。以下的 `100.a.b.c` 是伺服器的 Tailscale IP，`100.x.y.z` 是路由器的（用 `tailscale ip -4` 查）。
+
+在路由器上（OpenWrt 25 用 `apk`；24 以前把第一行換成 `opkg update && opkg install tinyproxy`）：
+
+```sh
+apk update && apk add tinyproxy
+uci set tinyproxy.@tinyproxy[0].enabled='1'
+uci -q delete tinyproxy.@tinyproxy[0].Allow
+uci add_list tinyproxy.@tinyproxy[0].Allow='100.a.b.c'
+uci -q delete tinyproxy.@tinyproxy[0].LogFile
+uci set tinyproxy.@tinyproxy[0].Syslog='1'
+uci commit tinyproxy
+service tinyproxy enable
+service tinyproxy restart
+```
+
+`Allow` 只列伺服器的 Tailscale IP，家裡區網與其他 Tailscale 裝置都不能使用這個代理。不要設定 `Listen` 為 Tailscale IP：開機時 tinyproxy 比 Tailscale 早啟動，會綁定失敗。也不要在防火牆對 WAN 開放 8888 埠。
+
+在伺服器上先確認出口 IP 是家裡的，再寫進設定：
+
+```sh
+curl -x http://100.x.y.z:8888 https://ifconfig.me
+```
+
+```toml
+[browser]
+proxy = "http://100.x.y.z:8888"
+```
+
+`curl` 卡住逾時（而不是立刻回 403）代表封包沒到 tinyproxy，依序檢查：
+
+- `tailscale ping 100.x.y.z` 會通但 `curl` 不通時，先在路由器上看 `ip addr show tailscale0` 有沒有 `inet 100.x.y.z`。沒有的話執行 `service tailscale restart`；`tailscale ping` 不經過這個介面，所以它通不代表 TCP 連得上。
+- 路由器防火牆要允許 `tailscale0` 的輸入。先用 `uci show firewall | grep -i tailscale` 看是否已有包含 `tailscale0` 的區域，已有就不要再建同名區域（名稱重複會讓整份防火牆規則載入失敗）。
+- Tailscale ACL 要允許伺服器連到路由器的 8888 埠。
+
+之後家裡的 IP 就是巴哈看到的 IP：一旦被 Cloudflare 標記，你在家上巴哈也會多遇到驗證，所以請保持低請求量，不要手動反覆執行 `--once` 或 `--cleanup`。
+
 Chrome 不支援需要帳密的 socks5 代理，有帳密時請改用 http 代理。換了出口 IP 後，原本的 session 可能需要在新 IP 上重新登入或用 `/session` 重新上傳。
+
+## 建議做法：固定 Chrome 設定檔＋人工驗證
+
+本工具不會嘗試自動破解或繞過 Cloudflare 人機驗證（不偽裝指紋、不改 User-Agent、不接驗證碼代解服務）。穩定運作的做法是讓驗證由人完成一次，之後服務以「同一個瀏覽器」回訪，盡量不再觸發驗證：
+
+```toml
+[browser]
+user_data_dir = "/opt/Bahamut-Auto-Bump/chrome-profile"
+headless = false
+```
+
+設定 `user_data_dir` 後，服務每次都用同一個 Chrome 設定檔，登入 Cookie 與你親自通過驗證後取得的 Cookie 都留在設定檔裡，不再每次用空白瀏覽器加上 JSON 重建。需要登入或被驗證擋下時，在服務主機上執行：
+
+```sh
+sudo -u bahamut-bump .venv/bin/python bahamut_auto_bump.py --config config.toml --manual-login
+```
+
+它會用同一個設定檔開啟一般的 Chrome 視窗（沒有掛上自動化控制），請親自通過驗證並登入巴哈，看到文章後關閉整個 Chrome 視窗；接著會檢查設定檔是否已登入，並解除首頁登入的暫停。執行期間持有 `state.json.lock`，不需要停止服務。Telegram 的驗證通知也會提示這個步驟。
+
+注意事項：
+
+- 驗證結果綁定 IP 與瀏覽器，所以必須在服務主機上、用服務的出口 IP 操作（設定了 `browser.proxy` 時視窗也會走同一個代理）。在別台電腦通過驗證再搬 Cookie 過來沒有用。
+- 請用 `headless = false`。headless Chrome 的 User-Agent 是 `HeadlessChrome`，和你親自驗證的不是同一個瀏覽器。沒有螢幕的伺服器請安裝 Xvfb，並把 systemd 的 `ExecStart` 改為 `xvfb-run -a /opt/Bahamut-Auto-Bump/.venv/bin/python ...`；`--manual-login` 需要看得到視窗，可用 `ssh -X` 或 VNC。
+- 最穩定的環境是家用網路上、偶爾能開視窗的機器（桌機、迷你主機）。機房／VPS 的 IP 本身就容易被驗證。
+- 設定了 `user_data_dir` 時，`storage_state` 檔案只在設定檔未登入時匯入（Chrome 關閉時會丟掉沒有期限的 Cookie，所以每次驗證成功都會把 Cookie 寫回檔案，下次需要時再匯入）；匯入後仍未登入的檔案會被略過，直到換上新檔案（例如用 `/session` 上傳）。設定檔目錄含登入 Cookie，權限為 700，不可提交 Git。
 
 每次 session 驗證成功或首頁登入成功，都會把瀏覽器目前的 Cookie 寫回 `storage_state`，讓巴哈輪替後的登入 Cookie 持續保存在檔案中。
 
@@ -160,7 +224,7 @@ journalctl -u bahamut-auto-bump.service -f
 
 ## Telegram 通知與指令
 
-成功頂文通知會發送到 `target_chat_id` 頻道，錯誤與失敗通知則私訊給 `admin_chat_id`；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。瀏覽器正在執行頂文或清理時，指令會等該次瀏覽器操作結束後處理。
+成功頂文通知會發送到 `target_chat_id` 頻道，錯誤與失敗通知則私訊給 `admin_chat_id`；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。指令由獨立的背景執行緒處理，瀏覽器正在頂文、清理或等待限流時也會立即回應；只有 `/test_cookie` 與 `/test_login` 需要自己開瀏覽器，收到指令時會先回覆「正在測試」，完成後再回覆結果；頂文或清理進行中則回覆稍後再試。
 
 Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。輸入 `/toggle` 會顯示中文通知選單；每個按鈕以 `✅` 表示開啟、`❌` 表示關閉，不使用括弧顯示狀態。點擊後按鈕會立即切換並刷新為最新狀態，也支援 `/toggle success` 直接切換指定類型：
 

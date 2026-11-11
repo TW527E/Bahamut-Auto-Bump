@@ -55,8 +55,18 @@ proxy = ""
 # Use the system-installed Google Chrome Stable. This does not use or download
 # Playwright's Chromium for Testing build.
 channel = "chrome"
+# Recommended: a Chrome profile kept between runs. The login and any
+# verification you passed by hand (python bahamut_auto_bump.py --manual-login)
+# stay in this profile, so the service returns as the same browser every day
+# instead of a blank one. Use headless = false with it (xvfb-run on a server):
+# headless Chrome identifies itself as "HeadlessChrome" and is a different
+# browser from the one you verified. Leave empty to use storage_state only.
+user_data_dir = ""
 # Optional authenticated Playwright storage state. It is preferred when valid;
-# an expired or missing file falls back to the homepage login flow.
+# an expired or missing file falls back to the homepage login flow. With
+# user_data_dir set it is imported whenever the profile is signed out (Chrome
+# drops cookies without an expiry on exit) and rewritten after every verified
+# run; a file that did not sign in is skipped until it is replaced (/session).
 storage_state = "/opt/Bahamut-Auto-Bump/bahamut-session.json"
 # Homepage used for automatic login. Do not replace this with login.php.
 homepage_url = "https://www.gamer.com.tw/"
