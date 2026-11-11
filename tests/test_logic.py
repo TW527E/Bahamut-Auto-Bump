@@ -719,6 +719,30 @@ class CommandThreadTests(unittest.TestCase):
             mod.chrome_page = saved
         self.assertFalse(mod._BROWSER_BUSY.locked())
 
+    def test_slow_test_command_is_acknowledged_before_it_runs(self):
+        import bahamut_auto_bump as mod
+
+        events = []
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.config = {}
+        notifier.admin_chat_id = "1"
+        notifier.offset = 0
+        notifier.awaiting_session = False
+        notifier._write_state = lambda: None
+        notifier._command_reply = lambda text: events.append(("reply", text))
+        notifier._api = lambda method, params: {"result": [
+            {"update_id": 5, "message": {"chat": {"id": 1}, "text": "/test_cookie"}},
+        ]}
+        saved = mod.test_imported_session
+        mod.test_imported_session = lambda config: events.append(("test", ""))
+        try:
+            notifier.poll_commands()
+        finally:
+            mod.test_imported_session = saved
+        self.assertEqual([kind for kind, _ in events], ["reply", "test", "reply"])
+        self.assertIn("正在測試", events[0][1])
+        self.assertIn("測試成功", events[2][1])
+
     def test_polling_thread_survives_a_failing_command(self):
         import threading
         import bahamut_auto_bump as mod

@@ -224,7 +224,7 @@ journalctl -u bahamut-auto-bump.service -f
 
 ## Telegram 通知與指令
 
-成功頂文通知會發送到 `target_chat_id` 頻道，錯誤與失敗通知則私訊給 `admin_chat_id`；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。指令由獨立的背景執行緒處理，瀏覽器正在頂文、清理或等待限流時也會立即回應；只有 `/test_cookie` 與 `/test_login` 需要自己開瀏覽器，頂文或清理進行中會回覆稍後再試。
+成功頂文通知會發送到 `target_chat_id` 頻道，錯誤與失敗通知則私訊給 `admin_chat_id`；Cookie/session 驗證問題是 `auth`，頁面選擇器或時間解析問題是 `layout`，其他可安全重試的錯誤是 `error`，未預期程式錯誤是 `system`。服務會在背景以 `telegram.poll_interval_seconds` 輪詢 `admin_chat_id` 管理者聊天中的指令，預設每 2 秒一次，設定會保存到 `telegram_state.json`。指令由獨立的背景執行緒處理，瀏覽器正在頂文、清理或等待限流時也會立即回應；只有 `/test_cookie` 與 `/test_login` 需要自己開瀏覽器，收到指令時會先回覆「正在測試」，完成後再回覆結果；頂文或清理進行中則回覆稍後再試。
 
 Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天輸入 `/` 時會出現指令提示。輸入 `/toggle` 會顯示中文通知選單；每個按鈕以 `✅` 表示開啟、`❌` 表示關閉，不使用括弧顯示狀態。點擊後按鈕會立即切換並刷新為最新狀態，也支援 `/toggle success` 直接切換指定類型：
 

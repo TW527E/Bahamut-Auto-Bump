@@ -1852,12 +1852,15 @@ class TelegramNotifier:
                 self._write_state()
                 self._command_reply("請直接上傳新的 bahamut-session.json 文件；收到後會原子替換目前 session。")
             elif name in {"/test_cookie", "/test_session"}:
+                # The test opens Chrome and loads the thread; say so right away.
+                self._command_reply("收到，正在測試 Cookie/session，大約需要半分鐘，完成後會回覆結果。")
                 try:
                     test_imported_session(self.config)
                     self._command_reply("Cookie/session 測試成功，巴哈姆特目前仍是登入狀態。")
                 except Exception as exc:
                     self._command_reply(f"Cookie/session 測試失敗：{exc}")
             elif name == "/test_login":
+                self._command_reply("收到，正在測試自動登入，大約需要一分鐘，完成後會回覆結果。")
                 try:
                     test_automatic_login(self.config)
                     self._command_reply("自動登入測試成功，已從巴哈姆特首頁登入。")
