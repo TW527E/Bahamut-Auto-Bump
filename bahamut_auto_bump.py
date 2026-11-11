@@ -10,6 +10,8 @@ import logging
 import os
 import random
 import re
+import shutil
+import subprocess
 import sys
 import time
 import urllib.parse
@@ -825,6 +827,63 @@ def verify_imported_session(page: Any, config: dict[str, Any]) -> None:
     _save_session(page, config)
 
 
+def profile_dir(config: dict[str, Any]) -> str:
+    """[browser] user_data_dir: a Chrome profile kept between runs, or "" for none."""
+    return str(config["browser"].get("user_data_dir", "")).strip()
+
+
+PROFILE_IMPORT_MARKER = "bahamut-session-imported"
+
+
+def _import_session_file(page: Any, config: dict[str, Any]) -> bool:
+    """Load a storage_state file into the Chrome profile, once per file version.
+
+    With a profile the cookies live in the profile, so the file only matters
+    when it is newer than the last import (a /session upload, for example).
+    Returns True when cookies were added and the session is worth re-checking.
+    """
+    storage_state = str(config["browser"].get("storage_state", "")).strip()
+    profile = profile_dir(config)
+    if not storage_state or not profile:
+        return False
+    path = Path(storage_state)
+    marker = Path(profile) / PROFILE_IMPORT_MARKER
+    try:
+        stamp = str(path.stat().st_mtime_ns)
+    except OSError:
+        return False
+    try:
+        if marker.read_text(encoding="utf-8").strip() == stamp:
+            return False
+    except OSError:
+        pass
+    try:
+        cookies = json.loads(path.read_text(encoding="utf-8"))["cookies"]
+        page.context.add_cookies(cookies)
+    except Exception as exc:
+        LOG.warning("Could not import %s into the Chrome profile: %s", storage_state, exc)
+        return False
+    try:
+        marker.write_text(stamp, encoding="utf-8")
+    except OSError as exc:
+        LOG.warning("Could not record the session import in %s: %s", marker, exc)
+    LOG.info("Imported cookies from %s into the Chrome profile", storage_state)
+    return True
+
+
+def verify_profile_session(page: Any, config: dict[str, Any]) -> None:
+    """Verify the Chrome profile is signed in, importing a newer storage_state first if needed."""
+    try:
+        _authenticated_thread_page(page, config)
+    except (RateLimited, AntiBotChallenge):
+        raise
+    except CannotConfirm:
+        if not _import_session_file(page, config):
+            raise
+        _authenticated_thread_page(page, config)
+    LOG.info("Using signed-in Chrome profile: %s", profile_dir(config))
+
+
 def _save_session(page: Any, config: dict[str, Any]) -> None:
     """Write the context's current cookies back to storage_state.
 
@@ -1038,7 +1097,16 @@ def authenticate(page: Any, config: dict[str, Any]) -> None:
     retry, so a fresh one uploaded with /session is used right away.
     """
     storage_state = str(config["browser"].get("storage_state", "")).strip()
-    if storage_state and Path(storage_state).exists():
+    profile = profile_dir(config)
+    if profile:
+        try:
+            verify_profile_session(page, config)
+            return
+        except (RateLimited, AntiBotChallenge):
+            raise
+        except CannotConfirm as exc:
+            LOG.warning("Chrome profile is not signed in; attempting homepage login: %s", exc)
+    elif storage_state and Path(storage_state).exists():
         try:
             verify_imported_session(page, config)
             return
@@ -1061,6 +1129,7 @@ def authenticate(page: Any, config: dict[str, Any]) -> None:
         message = (
             f"{exc}; challenged {strikes} time(s) in a row, homepage login paused for {seconds} seconds "
             f"(until {resume}); upload a fresh session with /session"
+            + (" or run --manual-login on the service host" if profile else "")
         )
         _write_login_pause(config, {"until": until, "strikes": strikes, "message": message})
         raise AntiBotChallenge(message) from exc
@@ -1100,6 +1169,73 @@ def browser_proxy(config: dict[str, Any]) -> dict[str, str] | None:
     return proxy
 
 
+def _prepare_profile(profile: str) -> None:
+    """Create the Chrome profile directory, private to the service user."""
+    path = Path(profile)
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        path.chmod(0o700)
+    except OSError as exc:
+        LOG.warning("Could not restrict permissions on %s: %s", profile, exc)
+
+
+def chrome_executable(config: dict[str, Any]) -> str:
+    """Path of the Chrome the service uses, for launching it without automation."""
+    explicit = str(config["browser"].get("executable_path", "")).strip()
+    if explicit:
+        return explicit
+    for name in ("google-chrome-stable", "google-chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    raise CannotConfirm("Could not find Google Chrome; set [browser] executable_path")
+
+
+def manual_login_command(config: dict[str, Any]) -> list[str]:
+    """Command line for a plain Chrome window on the service's profile.
+
+    --password-store=basic matches how Playwright launches Chrome; without it
+    a desktop keyring encrypts the cookies and the service cannot read them.
+    """
+    command = [
+        chrome_executable(config),
+        f"--user-data-dir={profile_dir(config)}",
+        "--password-store=basic",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--lang=zh-TW",
+    ]
+    proxy = browser_proxy(config)
+    if proxy:
+        command.append(f"--proxy-server={proxy['server']}")
+    command.append(str(config["thread"]["url"]))
+    return command
+
+
+def manual_login(config: dict[str, Any]) -> None:
+    """Let a person sign in and pass any verification in the service's Chrome profile.
+
+    Opens an ordinary Chrome window (no automation attached) on the same
+    profile and from the same host and IP the service browses with. Closing
+    the window hands the profile back; the service then checks it is signed in.
+    """
+    profile = profile_dir(config)
+    if not profile:
+        raise ConfigError("--manual-login requires [browser] user_data_dir")
+    with bump_lock(config):
+        _prepare_profile(profile)
+        print(
+            "已開啟一般的 Chrome 視窗（使用服務的設定檔）。請在視窗中完成人機驗證並登入巴哈姆特，"
+            "確認能看到文章後關閉整個 Chrome 視窗。",
+            flush=True,
+        )
+        subprocess.run(manual_login_command(config), check=False)
+        with chrome_page(config) as page:
+            verify_profile_session(page, config)
+        _write_login_pause(config, None)
+    print("設定檔已登入，服務下次檢查時會直接使用。", flush=True)
+
+
 @contextmanager
 def chrome_page(config: dict[str, Any], *, use_session: bool = True):
     """Launch the system Chrome, yield one page, and always close the browser."""
@@ -1115,11 +1251,26 @@ def chrome_page(config: dict[str, Any], *, use_session: bool = True):
     proxy = browser_proxy(config)
     if proxy:
         launch_options["proxy"] = proxy
+    profile = profile_dir(config) if use_session else ""
     with sync_playwright() as playwright:
         browser = None
         try:
-            browser = playwright.chromium.launch(**launch_options)
-            yield _new_context(browser, config, use_session=use_session).new_page()
+            if profile:
+                # One long-lived profile: cookies (the login and whatever a
+                # person earned by passing a verification in --manual-login)
+                # stay in Chrome instead of being rebuilt from JSON every run.
+                _prepare_profile(profile)
+                if launch_options["headless"]:
+                    # Headless Chrome announces itself as "HeadlessChrome", so
+                    # it is not the browser a person verified in --manual-login.
+                    LOG.warning("user_data_dir works best with headless = false (run under xvfb-run on a server)")
+                browser = playwright.chromium.launch_persistent_context(
+                    profile, locale="zh-TW", timezone_id=config["schedule"]["timezone"], **launch_options,
+                )
+                yield browser.pages[0] if browser.pages else browser.new_page()
+            else:
+                browser = playwright.chromium.launch(**launch_options)
+                yield _new_context(browser, config, use_session=use_session).new_page()
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
                 raise CannotConfirm(
@@ -1276,9 +1427,12 @@ def run_cleanup(config: dict[str, Any], max_deletions: int = 0) -> int:
 
 
 def test_imported_session(config: dict[str, Any]) -> None:
-    """Open Chrome with the imported storage state and verify authentication only."""
-    with chrome_page(config) as page:
-        verify_imported_session(page, config)
+    """Open Chrome with the profile or imported storage state and verify authentication only."""
+    with bump_lock(config), chrome_page(config) as page:
+        if profile_dir(config):
+            verify_profile_session(page, config)
+        else:
+            verify_imported_session(page, config)
 
 
 def test_automatic_login(config: dict[str, Any]) -> None:
@@ -1766,8 +1920,11 @@ def run_loop(config: dict[str, Any]) -> None:
             delay = _retry_delay_seconds(config, consecutive_failures)
             LOG.warning("Unable to safely confirm today's status: %s; retrying in %s seconds", exc, int(delay))
             kind = notification_kind(exc)
+            hint = ""
+            if isinstance(exc, AntiBotChallenge) and profile_dir(config):
+                hint = "\n處理方式：在服務主機執行 --manual-login，於一般 Chrome 視窗親自通過驗證後關閉視窗"
             if failures.should_send(kind, str(exc), now.date().isoformat()):
-                notifier.send(kind, f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{kind}\n原因：{exc}\n（同樣的問題今天不再重複通知，服務仍會重試，下次約 {int(delay)} 秒後）")
+                notifier.send(kind, f"巴哈姆特自動頂文發生問題\n文章：{config['thread']['url']}\n類型：{kind}\n原因：{exc}{hint}\n（同樣的問題今天不再重複通知，服務仍會重試，下次約 {int(delay)} 秒後）")
             sleep_with_telegram(int(delay), notifier)
 
 
@@ -1778,11 +1935,18 @@ def main() -> int:
     parser.add_argument("--cleanup", action="store_true", help="inspect and clean old owned replies")
     parser.add_argument("--apply", action="store_true", help="allow live deletion with --cleanup; otherwise dry-run")
     parser.add_argument("--cleanup-limit", type=int, default=0, help="maximum replies to delete during --cleanup (0 = all)")
+    parser.add_argument(
+        "--manual-login", action="store_true",
+        help="open a normal Chrome window on [browser] user_data_dir to sign in and pass verification by hand",
+    )
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     notifier = None
     try:
         config = load_config(args.config)
+        if args.manual_login:
+            manual_login(config)
+            return 0
         if args.cleanup:
             cleanup_values = dict(config["cleanup"])
             if args.apply:
