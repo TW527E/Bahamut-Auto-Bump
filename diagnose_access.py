@@ -8,6 +8,8 @@ password are never written.
 
 import argparse
 import json
+import os
+import re
 import time
 import urllib.error
 import urllib.parse
@@ -68,6 +70,11 @@ def session_summary(path: str) -> dict[str, Any]:
     return {"path": path, "exists": True, "modified": modified, "cookies": cookies}
 
 
+def _strip_scripts(html: str) -> str:
+    """Drop inline scripts: signed-in pages embed per-account delete tokens (pdel code/pwd) in them."""
+    return re.sub(r"(?is)(<script\b[^>]*>).*?(</script\s*>)", r"\1/* removed by diagnose_access */\2", html)
+
+
 def browser_visit(config: dict[str, Any], url: str, label: str, output: Path, *, use_session: bool) -> dict[str, Any]:
     """Open url in the service's Chrome and snapshot it on load and again after a challenge would have finished."""
     result: dict[str, Any] = {"label": label, "url": url, "use_session": use_session}
@@ -92,7 +99,7 @@ def browser_visit(config: dict[str, Any], url: str, label: str, output: Path, *,
             stem = output / f"{label}-{moment}"
             try:
                 page.screenshot(path=f"{stem}.png", full_page=False)
-                Path(f"{stem}.html").write_text(page.content(), encoding="utf-8")
+                Path(f"{stem}.html").write_text(_strip_scripts(page.content()), encoding="utf-8")
             except Exception as exc:
                 snapshot["capture_error"] = repr(exc)
             result[moment] = snapshot
@@ -106,7 +113,10 @@ def main() -> int:
     parser.add_argument("--headed", action="store_true", help="also run a visible Chrome (run under xvfb-run on a server)")
     args = parser.parse_args()
     config = load_config(args.config)
+    # Screenshots and pages show the signed-in account; keep them private to the service user.
+    os.umask(0o077)
     args.output.mkdir(parents=True, exist_ok=True)
+    args.output.chmod(0o700)
     homepage = str(config["browser"].get("homepage_url", "https://www.gamer.com.tw/"))
     thread = str(config["thread"]["url"])
 
