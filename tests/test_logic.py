@@ -542,7 +542,7 @@ class ChallengedPage:
 
 
 class AntiBotChallengeTests(unittest.TestCase):
-    config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_retries": 3}}
+    config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_retries": 3, "challenge_auto_solve_seconds": 0}}
 
     def _goto(self, page):
         import bahamut_auto_bump as mod
@@ -566,6 +566,57 @@ class AntiBotChallengeTests(unittest.TestCase):
 
     def test_challenge_is_reported_as_auth(self):
         self.assertEqual(notification_kind(AntiBotChallenge("blocked")), "auth")
+
+    def test_challenge_auto_resolve_waits_then_passes(self):
+        """When the challenge clears mid-wait, _goto succeeds."""
+        import bahamut_auto_bump as mod
+
+        class ResolvingPage(ChallengedPage):
+            """Simulates a challenge that resolves after two title() checks."""
+            def __init__(self):
+                super().__init__("請稍候...", {}, status=200)
+                self._checks = 0
+
+            def title(self):
+                self._checks += 1
+                return "請稍候..." if self._checks <= 2 else "巴哈姆特電玩資訊站"
+
+            def wait_for_load_state(self, *a, **kw):
+                pass
+
+            def frame_locator(self, *a, **kw):
+                class _Empty:
+                    def locator(self, *a, **kw):
+                        return self
+                    def count(self):
+                        return 0
+                    def first(self):
+                        return self
+                return _Empty()
+
+            def locator(self, *a, **kw):
+                class _Empty:
+                    def count(self):
+                        return 0
+                    def is_visible(self):
+                        return False
+                return _Empty()
+
+        page = ResolvingPage()
+        config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_retries": 0, "challenge_auto_solve_seconds": 5}}
+        mod._last_navigation = 0.0
+        # Should not raise — challenge resolves before timeout
+        mod._goto(page, "https://www.gamer.com.tw/", config)
+
+    def test_challenge_auto_resolve_disabled_raises_immediately(self):
+        """With challenge_auto_solve_seconds=0, behaviour matches the old code."""
+        page = ChallengedPage("請稍候...", {"cf-mitigated": "challenge"}, status=403)
+        config = {"browser": {"navigation_interval_seconds": 0, "rate_limit_retries": 0, "challenge_auto_solve_seconds": 0}}
+        import bahamut_auto_bump as mod
+        mod._last_navigation = 0.0
+        with self.assertRaises(AntiBotChallenge):
+            mod._goto(page, "https://www.gamer.com.tw/", config)
+        self.assertEqual(len(page.visits), 1)
 
 
 class LoginPauseTests(unittest.TestCase):

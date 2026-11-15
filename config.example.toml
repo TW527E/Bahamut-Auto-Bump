@@ -46,6 +46,11 @@ rate_limit_retries = 3
 # challenge_login_pause_max_seconds. The session is still checked on every retry.
 challenge_login_pause_seconds = 21600
 challenge_login_pause_max_seconds = 172800
+# When Cloudflare's Turnstile challenge appears, wait this many seconds for it
+# to auto-resolve before giving up. Turnstile often passes automatically for a
+# persistent Chrome profile that has been verified by hand. Set to 0 to fail
+# immediately (the old behaviour).
+challenge_auto_solve_seconds = 30
 # Optional proxy for Chrome, e.g. "socks5://127.0.0.1:1080" for an SSH tunnel
 # to a VPS (ssh -D 1080 -N user@vps). Cloudflare flags the IP that browses, so
 # this keeps the service host's own IP out of it. Leave empty to browse directly.
