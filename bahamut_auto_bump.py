@@ -199,7 +199,7 @@ def _challenge_error(page: Any, where: str) -> AntiBotChallenge:
     )
 
 
-def _wait_for_challenge(page: Any, config: dict[str, Any], where: str) -> bool:
+def _wait_for_challenge(page: Any, config: dict[str, Any], where: str, *, header_only: bool = False) -> bool:
     """Wait for a Cloudflare Turnstile challenge to auto-resolve.
 
     Turnstile's managed/invisible mode often passes automatically for browsers
@@ -259,7 +259,7 @@ def _wait_for_challenge(page: Any, config: dict[str, Any], where: str) -> bool:
             if str(page.url) != challenge_origin_url and not _challenged(page):
                 LOG.info("Cloudflare challenge resolved (page navigated away)")
                 return True
-            if not _challenged(page):
+            if not header_only and not _challenged(page):
                 LOG.info("Cloudflare challenge resolved automatically")
                 return True
             # Check for cf-turnstile-response token in the page.
@@ -390,7 +390,8 @@ def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
         _pace(config)
         response = page.goto(url, wait_until="domcontentloaded")
         if _challenged(page, response):
-            if not _wait_for_challenge(page, config, f"{parsed.netloc}{path}"):
+            title_challenged = _challenged(page)
+            if not _wait_for_challenge(page, config, f"{parsed.netloc}{path}", header_only=not title_challenged):
                 raise _challenge_error(page, f"{parsed.netloc}{path}")
             # After the challenge resolved, re-check: the page may have
             # redirected back to the original URL automatically, or it may
@@ -501,11 +502,12 @@ def _read_current_page_posts(page: Any, config: dict[str, Any], *, first_page: b
             title = page.title()
             if _challenged(page) and not _wait_for_challenge(page, config, "the thread scan"):
                 raise _challenge_error(page, "the thread scan")
-            if page.locator("#BH-master").count() == 0:
-                raise CannotConfirm(f"Thread page layout is missing at {page.url}; title={title!r}")
-            page_number = urllib.parse.parse_qs(urllib.parse.urlparse(str(page.url)).query).get("page", ["?"])[0]
-            LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
-            return []
+            if posts_locator.count() == 0:
+                if page.locator("#BH-master").count() == 0:
+                    raise CannotConfirm(f"Thread page layout is missing at {page.url}; title={title!r}")
+                page_number = urllib.parse.parse_qs(urllib.parse.urlparse(str(page.url)).query).get("page", ["?"])[0]
+                LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
+                return []
         posts_locator.first.wait_for(state="attached", timeout=timeout)
         rows = page.locator("section[id^='post_']").evaluate_all(
             """
