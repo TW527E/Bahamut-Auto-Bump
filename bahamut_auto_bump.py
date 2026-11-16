@@ -4,13 +4,18 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import binascii
 import fcntl
+import hashlib
+import hmac
 import json
 import logging
 import os
 import random
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -1077,17 +1082,26 @@ def _account_credentials(config: dict[str, Any]) -> tuple[str, str, str]:
     return username, password, totp_secret
 
 
-def _totp_code(secret: str) -> str:
+def _totp_code(secret: str, now: float | None = None) -> str:
+    """RFC 6238 code (SHA-1, 30 s, 6 digits) with the standard library.
+
+    pyotp 2.12+ rejects secrets shorter than 112 bits, but Bahamut issues
+    16-character (80-bit) secrets, so it cannot be used here.
+    """
     if not secret:
         return ""
+    cleaned = secret.replace(" ", "").replace("-", "").upper()
     try:
-        import pyotp
-    except ImportError as exc:
-        raise CannotConfirm('TOTP is configured but pyotp is not installed; run pip install "pyotp>=2.9,<3"') from exc
-    try:
-        return pyotp.TOTP(secret.replace(" ", "")).now()
-    except Exception as exc:
+        key = base64.b32decode(cleaned + "=" * (-len(cleaned) % 8))
+    except (binascii.Error, ValueError) as exc:
         raise CannotConfirm("Configured TOTP secret is invalid") from exc
+    if not key:
+        raise CannotConfirm("Configured TOTP secret is invalid")
+    counter = int((time.time() if now is None else now) // 30)
+    digest = hmac.new(key, struct.pack(">Q", counter), hashlib.sha1).digest()
+    offset = digest[-1] & 0x0F
+    code = (struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF) % 1_000_000
+    return f"{code:06d}"
 
 
 def login_from_homepage(page: Any, config: dict[str, Any]) -> None:

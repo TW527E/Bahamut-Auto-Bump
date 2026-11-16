@@ -1,3 +1,1 @@
 playwright>=1.45,<2
-# Optional: only needed when [account] totp_secret is set.
-#   pip install "pyotp>=2.9,<3"

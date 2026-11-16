@@ -14,6 +14,7 @@ from bahamut_auto_bump import (
     RateLimited,
     TelegramNotifier,
     _account_credentials,
+    _totp_code,
     _thread_page_urls,
     deletion_candidates,
     finish_pending_bump,
@@ -66,6 +67,22 @@ class AuthenticationConfigTests(unittest.TestCase):
             "selectors": {},
         }
         self.assertEqual(_account_credentials(config), ("user", "pass", "ABC123"))
+
+
+class TotpTests(unittest.TestCase):
+    def test_rfc6238_vector(self):
+        # RFC 6238 appendix B, SHA-1, T = 59 s: 94287082 -> last 6 digits
+        self.assertEqual(_totp_code("GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ", now=59), "287082")
+
+    def test_short_bahamut_style_secret(self):
+        # 16 base32 characters (80 bits), lower case and spaces allowed
+        code = _totp_code("jbsw y3dp ehpk 3pxp", now=1_700_000_000)
+        self.assertRegex(code, r"^[0-9]{6}$")
+        self.assertEqual(code, _totp_code("JBSWY3DPEHPK3PXP", now=1_700_000_000))
+
+    def test_invalid_secret(self):
+        with self.assertRaises(CannotConfirm):
+            _totp_code("not-base32!")
 
 
 class ConfigLoadingTests(unittest.TestCase):
