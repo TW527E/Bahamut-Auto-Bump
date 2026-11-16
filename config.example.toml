@@ -111,6 +111,9 @@ target_chat_id = "-1001234567890"
 # Error and failure notifications are also delivered here privately, while
 # success notifications go to target_chat_id above.
 admin_chat_id = "123456789"
+# Only needed when admin_chat_id is a group: the Telegram user ids allowed to
+# send commands there. Other group members are ignored.
+# admin_user_ids = ["123456789"]
 state_file = "telegram_state.json"
 # The service checks Telegram this often while waiting for the next scheduled
 # run. Lower values make commands respond faster but create more API requests.

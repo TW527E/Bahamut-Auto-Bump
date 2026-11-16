@@ -256,12 +256,13 @@ class PendingBumpTests(unittest.TestCase):
             "cleanup": cleanup,
         }
 
-    def _run(self, state, posts, config, page=None, delete=None, verify=None):
+    def _run(self, state, posts, config, page=None, delete=None, verify=None, current=None):
         import bahamut_auto_bump as mod
         page = page or RecordingPage()
-        saved = (mod.delete_post, mod.verify_post_deleted, mod.state_path, mod.time.sleep)
+        saved = (mod.delete_post, mod.verify_post_deleted, mod.state_path, mod.time.sleep, mod.current_post_is_own_bump)
         mod.delete_post = delete or (lambda p, c, post: p.deleted.append(post.sn))
         mod.verify_post_deleted = verify or (lambda p, c, post: p.verified.append(post.sn))
+        mod.current_post_is_own_bump = current or (lambda p, c, sn: True)
         mod.time.sleep = lambda s: None
         with tempfile.TemporaryDirectory() as tmp:
             state_file = Path(tmp) / "state.json"
@@ -269,7 +270,8 @@ class PendingBumpTests(unittest.TestCase):
             try:
                 done = finish_pending_bump(page, config, state, posts, self.now)
             finally:
-                mod.delete_post, mod.verify_post_deleted, mod.state_path, mod.time.sleep = saved
+                (mod.delete_post, mod.verify_post_deleted, mod.state_path, mod.time.sleep,
+                 mod.current_post_is_own_bump) = saved
         return done, page, state
 
     def test_missing_new_reply_leaves_pending(self):
@@ -324,6 +326,29 @@ class PendingBumpTests(unittest.TestCase):
         done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
         self.assertTrue(done)
         self.assertEqual(page.deleted, ["80", "70"])
+        self.assertEqual([entry["sn"] for entry in state["bump_inventory"]], ["150"])
+
+    def test_edited_inventory_reply_is_kept_and_forgotten(self):
+        state = {
+            "pending_bump": {"thread_url": self.url, "before_sn": 100},
+            "bump_inventory": [{"sn": "70", "floor": 2, "date": "2026-01-02"}, {"sn": "80", "floor": 4, "date": "2026-01-03"}],
+        }
+        posts = [PostInfo(6, "150", True, "2026-01-05 09:00:00", True)]
+        current = lambda p, c, sn: sn != "80"
+        done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False), current=current)
+        self.assertTrue(done)
+        self.assertEqual(page.deleted, ["70"])
+        self.assertEqual([entry["sn"] for entry in state["bump_inventory"]], ["150"])
+
+    def test_recovery_adds_confirmed_bump_missing_from_inventory(self):
+        state = {
+            "pending_bump": {"thread_url": self.url, "before_sn": 100, "posted_sn": "150", "posted_date": "2026-01-05"},
+            "bump_inventory": [{"sn": "80", "floor": 4, "date": "2026-01-03"}],
+        }
+        posts = [PostInfo(4, "80", True, "2026-01-03 09:00:00", True), PostInfo(6, "150", True, "2026-01-05 09:00:00", True)]
+        done, page, state = self._run(state, posts, self._config(enabled=True, dry_run=False))
+        self.assertTrue(done)
+        self.assertEqual(page.deleted, ["80"])
         self.assertEqual([entry["sn"] for entry in state["bump_inventory"]], ["150"])
 
     def test_missing_reply_reads_only_the_previous_page(self):
@@ -770,6 +795,28 @@ class CommandThreadTests(unittest.TestCase):
             mod.chrome_page = saved
         self.assertFalse(mod._BROWSER_BUSY.locked())
 
+    def test_group_member_without_admin_user_id_is_ignored(self):
+        events = []
+        notifier = TelegramNotifier.__new__(TelegramNotifier)
+        notifier.config = {}
+        notifier.admin_chat_id = "-1001"
+        notifier.admin_user_ids = {"42"}
+        notifier.offset = 0
+        notifier.awaiting_session = False
+        notifier._write_state = lambda: None
+        notifier._command_reply = lambda text: events.append(text)
+        notifier._api = lambda method, params: {"result": [
+            {"update_id": 5, "message": {"chat": {"id": -1001}, "from": {"id": 7}, "text": "/help"}},
+            {"update_id": 6, "message": {"chat": {"id": -1001}, "text": "/help"}},
+        ]}
+        notifier.poll_commands()
+        self.assertEqual(events, [])
+        notifier._api = lambda method, params: {"result": [
+            {"update_id": 7, "message": {"chat": {"id": -1001}, "from": {"id": 42}, "text": "/help"}},
+        ]}
+        notifier.poll_commands()
+        self.assertEqual(len(events), 1)
+
     def test_slow_test_command_is_acknowledged_before_it_runs(self):
         import bahamut_auto_bump as mod
 
@@ -777,12 +824,13 @@ class CommandThreadTests(unittest.TestCase):
         notifier = TelegramNotifier.__new__(TelegramNotifier)
         notifier.config = {}
         notifier.admin_chat_id = "1"
+        notifier.admin_user_ids = set()
         notifier.offset = 0
         notifier.awaiting_session = False
         notifier._write_state = lambda: None
         notifier._command_reply = lambda text: events.append(("reply", text))
         notifier._api = lambda method, params: {"result": [
-            {"update_id": 5, "message": {"chat": {"id": 1}, "text": "/test_cookie"}},
+            {"update_id": 5, "message": {"chat": {"id": 1}, "from": {"id": 1}, "text": "/test_cookie"}},
         ]}
         saved = mod.test_imported_session
         mod.test_imported_session = lambda config: events.append(("test", ""))
@@ -857,6 +905,21 @@ class SaveSessionTests(unittest.TestCase):
             self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["cookies"][0]["value"], "new")
             self.assertEqual(path.stat().st_mode & 0o777, 0o600)
             self.assertEqual([item.name for item in Path(tmp).iterdir()], ["session.json"])
+
+
+class ScheduleCapTests(unittest.TestCase):
+    def test_late_schedule_with_jitter_stays_on_the_same_day(self):
+        import bahamut_auto_bump as mod
+        tz = ZoneInfo("Asia/Taipei")
+        config = {"schedule": {"time": "23:59", "schedule_jitter_seconds": 1800}}
+        for day in range(1, 29):
+            now = datetime(2026, 11, day, 12, 0, tzinfo=tz)
+            due = mod.scheduled_due(now, config)
+            self.assertEqual(due.date(), now.date())
+        config = {"schedule": {"time": "09:00", "schedule_jitter_seconds": 1800}}
+        now = datetime(2026, 11, 15, 8, 0, tzinfo=tz)
+        due = mod.scheduled_due(now, config)
+        self.assertGreaterEqual(due, datetime(2026, 11, 15, 9, 0, tzinfo=tz))
 
 
 if __name__ == "__main__":

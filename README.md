@@ -86,7 +86,7 @@ sudo -u bahamut-bump .venv/bin/python bahamut_auto_bump.py --config config.toml 
 
 每次 session 驗證成功或首頁登入成功，都會把瀏覽器目前的 Cookie 寫回 `storage_state`，讓巴哈輪替後的登入 Cookie 持續保存在檔案中。
 
-要確認主機看到的是什麼，可停止服務後執行 `diagnose_access.py`。它會用服務的設定分別以純 HTTP、帶 session 的 Chrome 與不帶 session 的 Chrome 開啟文章與首頁，把報告、截圖與 HTML 存到 `diagnostics/`（不會寫出 Cookie 值或密碼）：
+要確認主機看到的是什麼，可停止服務後執行 `diagnose_access.py`。它會用服務的設定分別以純 HTTP、帶 session 的 Chrome 與不帶 session 的 Chrome 開啟文章與首頁，把報告、截圖與 HTML 存到 `diagnostics/`（不會寫出 Cookie 值或密碼；HTML 會移除內嵌 script 以免帶出刪文憑證，輸出目錄僅服務帳號可讀。截圖仍會顯示登入帳號，分享前請先檢查）：
 
 ```bash
 sudo systemctl stop bahamut-auto-bump
@@ -239,7 +239,7 @@ Bot 啟動時會透過 Telegram `setMyCommands` 註冊指令，因此在聊天�
 /help                  查看指令
 ```
 
-「今天已經頂過」是例行檢查結果，不會發送通知。Telegram API 連線失敗只寫入 systemd 日誌，避免通知失敗造成無限遞迴。Bot 必須能讀取管理者私聊訊息；若使用群組管理指令，請將該群組 ID 設為 `admin_chat_id`。
+「今天已經頂過」是例行檢查結果，不會發送通知。Telegram API 連線失敗只寫入 systemd 日誌，避免通知失敗造成無限遞迴。Bot 必須能讀取管理者私聊訊息；若使用群組管理指令，請將該群組 ID 設為 `admin_chat_id`，並在 `admin_user_ids` 列出可下指令的管理者使用者 ID；群組中其他成員的指令與按鈕會被忽略。
 
 `/session` 只接受 `admin_chat_id` 發出的命令；送出命令後直接上傳新的 `bahamut-session.json` 文件即可。Bot 會先驗證 JSON 包含 Playwright `cookies` 陣列，再以原子方式替換 `browser.storage_state` 指定的檔案。替換後可用 `/test_cookie` 立即確認登入狀態。若沒有 session 或想確認帳密自動登入，可使用 `/test_login`；它會用乾淨的 Chrome context 從首頁登入，不執行頂文或清理，成功後若設定了 `storage_state` 會保存新的 session。Cookie/session 失效時，例行檢查會把 `auth` 通知私訊給 `admin_chat_id`。同一種問題（類型與原因相同，比對時忽略頁面標題與數字）一天只通知一次，服務仍會持續重試（間隔見上方 systemd 一節）。
 
