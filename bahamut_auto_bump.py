@@ -558,18 +558,58 @@ def delete_post(page: Any, config: dict[str, Any], post: PostInfo) -> None:
         LOG.warning("Delete navigation ended early; verifying the post: %s", exc)
 
 
-def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> None:
-    """Verify one deletion through Bahamut's canonical single-post URL."""
+def _single_post_url(config: dict[str, Any], sn: str) -> str:
+    """Bahamut's canonical single-post URL for one post number."""
     thread = urllib.parse.urlparse(str(config["thread"]["url"]))
     query = urllib.parse.parse_qs(thread.query)
     bsn = query.get("bsn", [""])[0]
     if not bsn:
-        raise CannotConfirm("Thread URL has no bsn for deletion verification")
-    verification_url = urllib.parse.urljoin(
+        raise CannotConfirm("Thread URL has no bsn for single-post lookup")
+    return urllib.parse.urljoin(
         str(config["thread"]["url"]),
-        "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": post.sn}),
+        "Co.php?" + urllib.parse.urlencode({"bsn": bsn, "sn": sn}),
     )
-    _goto(page, verification_url, config)
+
+
+def current_post_is_own_bump(page: Any, config: dict[str, Any], sn: str) -> bool | None:
+    """Re-read one post just before deleting it.
+
+    Returns True when it is still the owner's reply matching content_template,
+    False when it exists but no longer matches (edited, or written with an
+    older template), and None when Bahamut says it is already gone.
+    """
+    _goto(page, _single_post_url(config, sn), config)
+    timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
+    page.locator("body").wait_for(state="attached", timeout=timeout)
+    row = page.evaluate(
+        """
+        ({postSn, contentSelector}) => {
+          const section = document.getElementById('post_' + postSn);
+          if (!section) return null;
+          const menu = section.querySelector('button.tippy-option-menu') || section.querySelector('[data-tippy]');
+          let meta = {};
+          try { meta = JSON.parse(menu?.getAttribute('data-tippy') || '{}'); } catch (_) {}
+          return {owner: meta.owner === true, text: section.querySelector(contentSelector)?.innerText || ''};
+        }
+        """,
+        {
+            "postSn": str(sn),
+            "contentSelector": str(config["selectors"].get("post_content_selector", ".c-article__content")),
+        },
+    )
+    if row is None:
+        if _challenged(page):
+            raise _challenge_error(page, "the pre-delete check")
+        if "此文章/討論串不存在或已被刪除" in page.locator("body").inner_text(timeout=timeout):
+            return None
+        raise CannotConfirm(f"Could not read post {sn} before deleting it; title={page.title()!r}")
+    template = str(config["thread"].get("content_template", DEFAULT_TEMPLATE))
+    return bool(row["owner"]) and is_bump_text(str(row["text"]), template)
+
+
+def verify_post_deleted(page: Any, config: dict[str, Any], post: PostInfo) -> None:
+    """Verify one deletion through Bahamut's canonical single-post URL."""
+    _goto(page, _single_post_url(config, post.sn), config)
     timeout = int(config["browser"].get("navigation_timeout_ms", 30000))
     page.locator("body").wait_for(state="attached", timeout=timeout)
     if page.locator(f"#post_{post.sn}").count():
@@ -625,13 +665,24 @@ def finish_pending_bump(
             raise CannotConfirm("New reply has a future timestamp")
         pending["posted_sn"] = posted.sn
         pending["posted_date"] = posted_at.date().isoformat()
-        write_state(state_path(config), state)
+        changed = True
         LOG.info("Confirmed submitted bump sn=%s at %s", posted.sn, posted_at.isoformat())
-        if posted.bump and state.get("bump_inventory") is not None:
-            inventory = state["bump_inventory"]
-            if not any(str(entry.get("sn")) == posted.sn for entry in inventory):
-                inventory.append({"sn": posted.sn, "floor": posted.floor, "date": posted_at.date().isoformat()})
-                write_state(state_path(config), state)
+    else:
+        changed = False
+
+    # Record the bump in the same save as its confirmation. On recovery, add it
+    # if an earlier run stopped after confirming but before updating the
+    # inventory, so cleanup never keeps an older bump instead of this one.
+    inventory = state.get("bump_inventory")
+    confirmed = next((post for post in posts if post.sn == pending["posted_sn"]), None)
+    if (
+        confirmed is not None and confirmed.bump and inventory is not None
+        and not any(str(entry.get("sn")) == confirmed.sn for entry in inventory)
+    ):
+        inventory.append({"sn": confirmed.sn, "floor": confirmed.floor, "date": pending["posted_date"]})
+        changed = True
+    if changed:
+        write_state(state_path(config), state)
 
     # Clean every older bump, not just the previous one, so a missed day is
     # caught up on the next bump instead of being left behind forever.
@@ -757,13 +808,22 @@ def cleanup_inventory(page: Any, config: dict[str, Any], state: dict[str, Any], 
         sn = str(target["sn"])
         floor = int(target.get("floor", 0))
         if dry_run:
-            LOG.info("Cleanup dry-run: would delete bump sn=%s (floor %s)", sn, floor)
+            LOG.info("Cleanup dry-run: would delete bump sn=%s (floor %s) if it still matches", sn, floor)
         else:
             post = PostInfo(floor, sn, True, "")
-            delete_post(page, config, post)
-            verify_post_deleted(page, config, post)
-            deleted += 1
-            LOG.info("Deleted bump sn=%s (floor %s)", sn, floor)
+            current = current_post_is_own_bump(page, config, sn)
+            if current is None:
+                LOG.info("Bump sn=%s (floor %s) is already gone; dropping it from the inventory", sn, floor)
+            elif not current:
+                LOG.warning(
+                    "Post sn=%s (floor %s) no longer matches content_template; keeping it and "
+                    "dropping it from the inventory", sn, floor,
+                )
+            else:
+                delete_post(page, config, post)
+                verify_post_deleted(page, config, post)
+                deleted += 1
+                LOG.info("Deleted bump sn=%s (floor %s)", sn, floor)
             state["bump_inventory"] = [
                 entry for entry in (state.get("bump_inventory") or []) if str(entry.get("sn")) != sn
             ]
@@ -914,6 +974,22 @@ def verify_profile_session(page: Any, config: dict[str, Any]) -> None:
     _save_session(page, config)
 
 
+# The browser thread saves rotated cookies while the Telegram thread may
+# install an uploaded session. Both write storage_state under this lock, and a
+# browser that started before the latest upload must not overwrite it.
+_SESSION_LOCK = threading.Lock()
+_session_generation = 0
+_page_session_generation: dict[int, int] = {}
+
+
+def _write_private_json(path: Path, temporary: Path, data: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
+        output.write(data)
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
 def _save_session(page: Any, config: dict[str, Any]) -> None:
     """Write the context's current cookies back to storage_state.
 
@@ -927,12 +1003,13 @@ def _save_session(page: Any, config: dict[str, Any]) -> None:
     path = Path(storage_state)
     temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        state = json.dumps(page.context.storage_state(), ensure_ascii=False)
-        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), "w", encoding="utf-8") as output:
-            output.write(state)
-        temporary.chmod(0o600)
-        temporary.replace(path)
+        with _SESSION_LOCK:
+            started = _page_session_generation.get(id(page))
+            if started is not None and started != _session_generation:
+                LOG.info("A new session was uploaded while the browser was running; keeping the uploaded file")
+                return
+            state = json.dumps(page.context.storage_state(), ensure_ascii=False)
+            _write_private_json(path, temporary, state)
     except OSError as exc:
         LOG.warning("Could not save Playwright storage state %s: %s", storage_state, exc)
         return
@@ -1297,10 +1374,17 @@ def chrome_page(config: dict[str, Any], *, use_session: bool = True):
                 browser = playwright.chromium.launch_persistent_context(
                     profile, locale="zh-TW", timezone_id=config["schedule"]["timezone"], **launch_options,
                 )
-                yield browser.pages[0] if browser.pages else browser.new_page()
+                page = browser.pages[0] if browser.pages else browser.new_page()
             else:
                 browser = playwright.chromium.launch(**launch_options)
-                yield _new_context(browser, config, use_session=use_session).new_page()
+                page = _new_context(browser, config, use_session=use_session).new_page()
+            with _SESSION_LOCK:
+                _page_session_generation[id(page)] = _session_generation
+            try:
+                yield page
+            finally:
+                with _SESSION_LOCK:
+                    _page_session_generation.pop(id(page), None)
         except Exception as exc:
             if "Executable doesn't exist" in str(exc) or "Failed to launch" in str(exc):
                 raise CannotConfirm(
@@ -1544,6 +1628,18 @@ def _day_jitter_seconds(now: datetime, config: dict[str, Any]) -> int:
     return int(random.Random(now.date().isoformat()).uniform(0, jitter))
 
 
+def scheduled_due(now: datetime, config: dict[str, Any]) -> datetime:
+    """Today's run time with its jitter, never pushed past today.
+
+    The loop recomputes the target from today's date. A late schedule plus
+    jitter that crossed midnight would be replaced by the next day's target
+    and skip a day, so the jittered time is capped at 23:59 the same day.
+    """
+    due = scheduled_datetime(now, config) + timedelta(seconds=_day_jitter_seconds(now, config))
+    latest = datetime.combine(now.date(), dt_time(23, 59), tzinfo=now.tzinfo)
+    return min(due, max(latest, scheduled_datetime(now, config)))
+
+
 TELEGRAM_ALLOWED_HOSTS = {"api.telegram.org"}
 
 
@@ -1590,6 +1686,13 @@ class TelegramNotifier:
         self.token = str(config["telegram"]["bot_token"])
         self.target_chat_id = str(config["telegram"]["target_chat_id"])
         self.admin_chat_id = str(config["telegram"]["admin_chat_id"])
+        # In a private chat the chat id is the admin's user id. A group admin
+        # chat additionally needs the user ids allowed to send commands there.
+        self.admin_user_ids = {str(value) for value in config["telegram"].get("admin_user_ids", [])}
+        if self.admin_chat_id.startswith("-") and not self.admin_user_ids:
+            LOG.warning(
+                "telegram.admin_chat_id is a group but telegram.admin_user_ids is empty; commands there are ignored"
+            )
         self.path = Path(str(config["telegram"].get("state_file", "telegram_state.json")))
         saved = self._read_state()
         self.offset = int(saved.get("offset", 0))
@@ -1711,11 +1814,20 @@ class TelegramNotifier:
         self._write_state()
         return reply
 
+    def _sender_allowed(self, chat: dict[str, Any], sender: dict[str, Any] | None) -> bool:
+        """Commands must come from the admin chat and from an allowed admin user in it."""
+        if str(chat.get("id")) != self.admin_chat_id:
+            return False
+        user_id = str((sender or {}).get("id", ""))
+        if not user_id:
+            return False
+        return user_id == self.admin_chat_id or user_id in self.admin_user_ids
+
     def _handle_callback(self, callback: dict[str, Any]) -> None:
         message = callback.get("message") or {}
         chat = message.get("chat") or {}
         callback_id = str(callback.get("id", ""))
-        if str(chat.get("id")) != self.admin_chat_id:
+        if not self._sender_allowed(chat, callback.get("from")):
             return
         prefix, _, kind = str(callback.get("data", "")).partition(":")
         if prefix != "notify" or (kind not in NOTIFICATION_TYPES and kind != "all"):
@@ -1750,11 +1862,12 @@ class TelegramNotifier:
         if not isinstance(state, dict) or not isinstance(state.get("cookies"), list):
             raise RuntimeError("Uploaded file is not a Playwright storage_state JSON")
         destination = Path(storage_state)
-        destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_suffix(destination.suffix + ".telegram.tmp")
-        temporary.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
-        os.chmod(temporary, 0o600)
-        temporary.replace(destination)
+        global _session_generation
+        with _SESSION_LOCK:
+            # Created 0600 from the start: the file holds login cookies.
+            _write_private_json(destination, temporary, json.dumps(state, ensure_ascii=False))
+            _session_generation += 1
         self.awaiting_session = False
         self.session_uploaded.set()
         self._write_state()
@@ -1823,7 +1936,7 @@ class TelegramNotifier:
                 continue
             message = update.get("message") or {}
             chat = message.get("chat") or {}
-            if str(chat.get("id")) != self.admin_chat_id:
+            if not self._sender_allowed(chat, message.get("from")):
                 continue
             text = str(message.get("text") or message.get("caption") or "").strip()
             command = text.split(maxsplit=1)
@@ -1965,7 +2078,7 @@ def run_loop(config: dict[str, Any]) -> None:
         now = taiwan_now(config)
         try:
             state = read_state(path)
-            due = scheduled_datetime(now, config) + timedelta(seconds=_day_jitter_seconds(now, config))
+            due = scheduled_due(now, config)
             if state.get("last_confirmed_date") == now.date().isoformat() and "pending_bump" not in state:
                 tomorrow = due + timedelta(days=1)
                 sleep_for = max(30, int((tomorrow - now).total_seconds()))
@@ -2015,8 +2128,8 @@ def main() -> int:
             return 0
         if args.cleanup:
             cleanup_values = dict(config["cleanup"])
-            if args.apply:
-                cleanup_values["dry_run"] = False
+            # A manual run deletes only with an explicit --apply, whatever the service's dry_run setting is.
+            cleanup_values["dry_run"] = not args.apply
             cleanup_config = {**config, "cleanup": cleanup_values}
             deleted = run_cleanup(cleanup_config, max_deletions=max(0, args.cleanup_limit))
             LOG.info("Cleanup finished; deleted %s post(s)", deleted)
