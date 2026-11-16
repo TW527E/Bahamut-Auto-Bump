@@ -204,6 +204,182 @@ def _challenge_error(page: Any, where: str) -> AntiBotChallenge:
     )
 
 
+def _wait_for_challenge(page: Any, config: dict[str, Any], where: str, *, header_only: bool = False) -> bool:
+    """Wait for a Cloudflare Turnstile challenge to auto-resolve.
+
+    Turnstile's managed/invisible mode often passes automatically for browsers
+    with a trusted profile (persistent cookies, non-headless, consistent
+    fingerprint).  Instead of failing immediately, poll the page for up to
+    ``challenge_auto_solve_seconds`` (default 30) to see whether the challenge
+    clears on its own.
+
+    Detection signals:
+    - The page title changes away from a challenge title.
+    - A ``cf-turnstile-response`` hidden input appears with a token value.
+    - The page navigates to a non-challenge URL.
+
+    Returns True when the challenge resolved, False when it did not (caller
+    should raise).
+    """
+    timeout = max(0, int(config["browser"].get("challenge_auto_solve_seconds", 30)))
+    if timeout <= 0:
+        return False
+    LOG.info(
+        "Cloudflare challenge detected at %s; waiting up to %s seconds for auto-resolution",
+        where, timeout,
+    )
+    poll = 2.0
+    deadline = time.monotonic() + timeout
+    challenge_origin_url = str(page.url)
+
+    # Monitor network requests for the Turnstile callback — the response POST
+    # that carries ``cf-turnstile-response`` signals that the challenge was
+    # solved even before the page navigates.
+    turnstile_solved = threading.Event()
+
+    def _on_response(response: Any) -> None:
+        try:
+            url = str(response.url)
+            if "turnstile" in url or "challenges.cloudflare.com" in url:
+                if response.status in range(200, 400):
+                    turnstile_solved.set()
+        except Exception:
+            pass
+
+    try:
+        page.on("response", _on_response)
+    except Exception:
+        pass
+
+    # Click the Turnstile checkbox if it appears — some challenge modes render
+    # an interactive widget that auto-solves only after the user "focuses" it.
+    _try_click_turnstile(page)
+    try:
+        while time.monotonic() < deadline:
+            try:
+                page.wait_for_load_state("domcontentloaded", timeout=int(poll * 1000))
+            except Exception:
+                pass
+            # Check if the page navigated away from the challenge.
+            if str(page.url) != challenge_origin_url and not _challenged(page):
+                LOG.info("Cloudflare challenge resolved (page navigated away)")
+                return True
+            if not header_only and not _challenged(page):
+                LOG.info("Cloudflare challenge resolved automatically")
+                return True
+            # Check for cf-turnstile-response token in the page.
+            try:
+                token = page.locator("input[name='cf-turnstile-response']").input_value(timeout=500)
+                if token:
+                    LOG.info("Cloudflare Turnstile token detected; waiting for redirect")
+                    # Token appeared — wait a bit for the page to navigate.
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=5000)
+                    except Exception:
+                        pass
+                    if not _challenged(page):
+                        return True
+            except Exception:
+                pass
+            # Check the network listener.
+            if turnstile_solved.is_set() and not _challenged(page):
+                LOG.info("Cloudflare challenge resolved (network callback detected)")
+                return True
+            _try_click_turnstile(page)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                time.sleep(min(poll, remaining))
+    finally:
+        try:
+            page.remove_listener("response", _on_response)
+        except Exception:
+            pass
+    LOG.warning("Cloudflare challenge did not resolve within %s seconds", timeout)
+    return False
+
+
+def _simulate_mouse_movement(page: Any, target_x: float, target_y: float) -> None:
+    """Move the mouse through several random waypoints before reaching the target.
+
+    Bot-detection behavioural analysis looks for perfectly straight or instant
+    cursor jumps.  This generates a short sequence of intermediate moves with
+    slight random offsets and humanised timing, ending at the target coordinate.
+    """
+    try:
+        viewport = page.viewport_size or {"width": 1280, "height": 720}
+        # Start from a random position in the upper area.
+        cx = random.uniform(viewport["width"] * 0.1, viewport["width"] * 0.9)
+        cy = random.uniform(viewport["height"] * 0.1, viewport["height"] * 0.4)
+        page.mouse.move(cx, cy)
+        # 2-4 waypoints with random detours.
+        steps = random.randint(2, 4)
+        for i in range(steps):
+            fraction = (i + 1) / (steps + 1)
+            wx = cx + (target_x - cx) * fraction + random.uniform(-30, 30)
+            wy = cy + (target_y - cy) * fraction + random.uniform(-20, 20)
+            # Clamp to viewport.
+            wx = max(0, min(viewport["width"], wx))
+            wy = max(0, min(viewport["height"], wy))
+            page.mouse.move(wx, wy, steps=random.randint(5, 15))
+            time.sleep(random.uniform(0.02, 0.08))
+        # Final move to the target.
+        page.mouse.move(target_x, target_y, steps=random.randint(8, 20))
+        time.sleep(random.uniform(0.05, 0.15))
+    except Exception:
+        pass
+
+
+def _try_click_turnstile(page: Any) -> None:
+    """Best-effort click on a visible Turnstile checkbox/iframe.
+
+    Cloudflare embeds the widget in an iframe whose ``src`` contains
+    ``challenges.cloudflare.com``.  Before clicking, simulate realistic mouse
+    movement to pass behavioural analysis.  The function tries multiple
+    selectors inside and outside the iframe.
+    """
+    def _humanised_click(locator: Any) -> bool:
+        """Move to the element then click with a short random delay."""
+        try:
+            box = locator.bounding_box(timeout=2000)
+            if not box:
+                return False
+            cx = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+            cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+            _simulate_mouse_movement(page, cx, cy)
+            time.sleep(random.uniform(0.05, 0.2))
+            page.mouse.click(cx, cy)
+            return True
+        except Exception:
+            return False
+
+    # Try inside the Turnstile iframe.
+    try:
+        iframe_locator = page.locator("iframe[src*='challenges.cloudflare.com']")
+        if iframe_locator.count():
+            # Click the iframe element itself (the checkbox is often the
+            # whole iframe area in managed mode).
+            if not _humanised_click(iframe_locator.first):
+                iframe_locator.first.click(timeout=2000, force=True)
+            # Also try reaching inside the frame for an explicit checkbox.
+            try:
+                frame = page.frame_locator("iframe[src*='challenges.cloudflare.com']")
+                checkbox = frame.locator("input[type='checkbox'], .mark, #challenge-stage, .ctp-checkbox-label")
+                if checkbox.count():
+                    checkbox.first.click(timeout=2000, force=True)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Some pages render the Turnstile widget outside an iframe as a div.
+    try:
+        widget = page.locator("#turnstile-wrapper, .cf-turnstile, [data-sitekey]")
+        if widget.count() and widget.first.is_visible():
+            if not _humanised_click(widget.first):
+                widget.first.click(timeout=2000, force=True)
+    except Exception:
+        pass
+
+
 def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
     """Navigate politely, wait out Bahamut's burst rate limit and fail on a challenge.
 
@@ -219,7 +395,14 @@ def _goto(page: Any, url: str, config: dict[str, Any]) -> Any:
         _pace(config)
         response = page.goto(url, wait_until="domcontentloaded")
         if _challenged(page, response):
-            raise _challenge_error(page, f"{parsed.netloc}{path}")
+            title_challenged = _challenged(page)
+            if not _wait_for_challenge(page, config, f"{parsed.netloc}{path}", header_only=not title_challenged):
+                raise _challenge_error(page, f"{parsed.netloc}{path}")
+            # After the challenge resolved, re-check: the page may have
+            # redirected back to the original URL automatically, or it may
+            # still show the challenge origin.  If the destination page is
+            # now visible, accept this response.
+            response = None  # headers are stale after challenge redirect
         if not _rate_limited(page, response):
             return response
         if attempt < retries:
@@ -322,13 +505,14 @@ def _read_current_page_posts(page: Any, config: dict[str, Any], *, first_page: b
             # page 2 may be empty while pages 14 and 16 still contain old
             # replies. Skip a confirmed empty thread page and keep scanning.
             title = page.title()
-            if _challenged(page):
+            if _challenged(page) and not _wait_for_challenge(page, config, "the thread scan"):
                 raise _challenge_error(page, "the thread scan")
-            if page.locator("#BH-master").count() == 0:
-                raise CannotConfirm(f"Thread page layout is missing at {page.url}; title={title!r}")
-            page_number = urllib.parse.parse_qs(urllib.parse.urlparse(str(page.url)).query).get("page", ["?"])[0]
-            LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
-            return []
+            if posts_locator.count() == 0:
+                if page.locator("#BH-master").count() == 0:
+                    raise CannotConfirm(f"Thread page layout is missing at {page.url}; title={title!r}")
+                page_number = urllib.parse.parse_qs(urllib.parse.urlparse(str(page.url)).query).get("page", ["?"])[0]
+                LOG.info("Thread page %s contains no posts after cleanup; continuing scan", page_number)
+                return []
         posts_locator.first.wait_for(state="attached", timeout=timeout)
         rows = page.locator("section[id^='post_']").evaluate_all(
             """
@@ -1300,6 +1484,281 @@ def _prepare_profile(profile: str) -> None:
         LOG.warning("Could not restrict permissions on %s: %s", profile, exc)
 
 
+# JavaScript injected into every new page/context to mask automation signals.
+# Cloudflare Turnstile and other bot detectors check navigator.webdriver,
+# plugins, WebGL, canvas fingerprints, AudioContext and more.  Replicating
+# the key evasions from puppeteer-extra-plugin-stealth / playwright-stealth
+# inline avoids adding a pip dependency.
+_STEALTH_INIT_SCRIPT = """
+// --- navigator.webdriver ---
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+
+// --- Chrome DevTools Protocol globals ---
+for (const key of Object.getOwnPropertyNames(window)) {
+    if (/^cdc_/.test(key)) { try { delete window[key]; } catch (_) {} }
+}
+
+// --- window.chrome completeness ---
+if (!window.chrome) { window.chrome = {}; }
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+        connect: function() {},
+        sendMessage: function() {},
+        onMessage: {addListener: function() {}, removeListener: function() {}},
+        onConnect: {addListener: function() {}, removeListener: function() {}},
+        id: undefined,
+    };
+}
+if (!window.chrome.app) {
+    window.chrome.app = {
+        isInstalled: false,
+        InstallState: {DISABLED: 'disabled', INSTALLED: 'installed', NOT_INSTALLED: 'not_installed'},
+        RunningState: {CANNOT_RUN: 'cannot_run', READY_TO_RUN: 'ready_to_run', RUNNING: 'running'},
+    };
+}
+if (!window.chrome.csi) { window.chrome.csi = function() { return {}; }; }
+if (!window.chrome.loadTimes) {
+    window.chrome.loadTimes = function() {
+        return {
+            commitLoadTime: Date.now() / 1000,
+            connectionInfo: 'h2',
+            finishDocumentLoadTime: Date.now() / 1000,
+            finishLoadTime: Date.now() / 1000,
+            firstPaintAfterLoadTime: 0,
+            firstPaintTime: Date.now() / 1000,
+            navigationType: 'Other',
+            npnNegotiatedProtocol: 'h2',
+            requestTime: Date.now() / 1000 - 0.16,
+            startLoadTime: Date.now() / 1000,
+            wasAlternateProtocolAvailable: false,
+            wasFetchedViaSpdy: true,
+            wasNpnNegotiated: true,
+        };
+    };
+}
+
+// --- navigator.plugins (realistic plugin array) ---
+(function() {
+    const pluginData = [
+        {name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format', mimeType: 'application/pdf'},
+        {name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: '', mimeType: 'application/pdf'},
+        {name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: '', mimeType: 'application/pdf'},
+        {name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: '', mimeType: 'application/pdf'},
+        {name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: '', mimeType: 'application/pdf'},
+    ];
+    if (navigator.plugins.length === 0) {
+        const fakePlugins = pluginData.map(p => {
+            const plugin = Object.create(Plugin.prototype);
+            Object.defineProperties(plugin, {
+                name: {value: p.name, enumerable: true},
+                filename: {value: p.filename, enumerable: true},
+                description: {value: p.description, enumerable: true},
+                length: {value: 1, enumerable: true},
+                0: {value: {type: p.mimeType, suffixes: 'pdf', description: p.description, enabledPlugin: plugin}},
+            });
+            return plugin;
+        });
+        Object.defineProperty(navigator, 'plugins', {
+            get: () => {
+                const arr = fakePlugins;
+                arr.item = i => arr[i] || null;
+                arr.namedItem = n => arr.find(p => p.name === n) || null;
+                arr.refresh = () => {};
+                return arr;
+            },
+        });
+        Object.defineProperty(navigator, 'mimeTypes', {
+            get: () => {
+                const mimes = [{type: 'application/pdf', suffixes: 'pdf', description: 'Portable Document Format'}];
+                mimes.item = i => mimes[i] || null;
+                mimes.namedItem = n => mimes.find(m => m.type === n) || null;
+                return mimes;
+            },
+        });
+    }
+})();
+
+// --- navigator.languages ---
+if (!navigator.languages || navigator.languages.length === 0) {
+    Object.defineProperty(navigator, 'languages', {get: () => ['zh-TW', 'zh', 'en-US', 'en']});
+}
+
+// --- navigator.platform ---
+if (/Linux/.test(navigator.platform) && /Win/.test(navigator.userAgent)) {
+    Object.defineProperty(navigator, 'platform', {get: () => 'Win32'});
+} else if (!navigator.platform) {
+    Object.defineProperty(navigator, 'platform', {get: () => 'Linux x86_64'});
+}
+
+// --- navigator.hardwareConcurrency ---
+if (navigator.hardwareConcurrency === undefined || navigator.hardwareConcurrency < 2) {
+    Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 4});
+}
+
+// --- navigator.deviceMemory ---
+if (navigator.deviceMemory === undefined || navigator.deviceMemory < 2) {
+    Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+}
+
+// --- WebGL vendor/renderer spoofing ---
+(function() {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    const UNMASKED_VENDOR = 0x9245;
+    const UNMASKED_RENDERER = 0x9246;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === UNMASKED_VENDOR) return 'Google Inc. (NVIDIA)';
+        if (param === UNMASKED_RENDERER) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+        return getParameter.call(this, param);
+    };
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(param) {
+            if (param === UNMASKED_VENDOR) return 'Google Inc. (NVIDIA)';
+            if (param === UNMASKED_RENDERER) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 Direct3D11 vs_5_0 ps_5_0, D3D11)';
+            return getParameter2.call(this, param);
+        };
+    }
+})();
+
+// --- Canvas fingerprint randomization ---
+(function() {
+    const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+    const origToBlob = HTMLCanvasElement.prototype.toBlob;
+    const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+    // Add subtle noise to canvas reads so the fingerprint is not a
+    // deterministic headless signature, but stays stable within one page load.
+    const noise = (function() {
+        let seed = Math.floor(Math.random() * 1000000);
+        return function() { seed = (seed * 16807 + 0) % 2147483647; return (seed % 5) - 2; };
+    })();
+    CanvasRenderingContext2D.prototype.getImageData = function() {
+        const data = origGetImageData.apply(this, arguments);
+        // Only perturb small canvases (fingerprinting) not full-page renders.
+        if (data.width * data.height < 500 * 500) {
+            for (let i = 0; i < data.data.length; i += 4) {
+                data.data[i] = Math.max(0, Math.min(255, data.data[i] + noise()));
+            }
+        }
+        return data;
+    };
+    HTMLCanvasElement.prototype.toDataURL = function() {
+        // Trigger a tiny invisible draw to shift the output.
+        const ctx = this.getContext && this.getContext('2d');
+        if (ctx) {
+            ctx.fillStyle = 'rgba(0,0,0,0.004)';
+            ctx.fillRect(0, 0, 1, 1);
+        }
+        return origToDataURL.apply(this, arguments);
+    };
+    HTMLCanvasElement.prototype.toBlob = function() {
+        const ctx = this.getContext && this.getContext('2d');
+        if (ctx) {
+            ctx.fillStyle = 'rgba(0,0,0,0.004)';
+            ctx.fillRect(0, 0, 1, 1);
+        }
+        return origToBlob.apply(this, arguments);
+    };
+})();
+
+// --- AudioContext fingerprint ---
+(function() {
+    if (typeof OfflineAudioContext === 'undefined') return;
+    const origGetFloatFrequencyData = AnalyserNode.prototype.getFloatFrequencyData;
+    AnalyserNode.prototype.getFloatFrequencyData = function(array) {
+        origGetFloatFrequencyData.call(this, array);
+        for (let i = 0; i < array.length; i++) {
+            array[i] += (Math.random() - 0.5) * 0.001;
+        }
+    };
+    const origCopyFromChannel = AudioBuffer.prototype.copyFromChannel;
+    AudioBuffer.prototype.copyFromChannel = function(dest, channel, start) {
+        origCopyFromChannel.call(this, dest, channel, start || 0);
+        for (let i = 0; i < dest.length; i++) {
+            dest[i] += (Math.random() - 0.5) * 0.0001;
+        }
+    };
+})();
+
+// --- permissions.query for notifications ---
+(function() {
+    const origQuery = navigator.permissions && navigator.permissions.query;
+    if (!origQuery) return;
+    navigator.permissions.query = function(desc) {
+        if (desc && desc.name === 'notifications') {
+            return Promise.resolve({state: Notification.permission, onchange: null});
+        }
+        return origQuery.call(this, desc);
+    };
+})();
+
+// --- Intl.DateTimeFormat timezone consistency ---
+// Ensured by Playwright's timezone_id context option; nothing extra needed.
+
+// --- Connection type ---
+if (navigator.connection && navigator.connection.rtt === 0) {
+    Object.defineProperty(navigator.connection, 'rtt', {get: () => 50, configurable: true});
+}
+
+// --- iframe contentWindow bypass ---
+// Prevent detection of cross-origin iframes returning null contentWindow,
+// which some detectors use to identify automation environments.
+(function() {
+    try {
+        const origDesc = Object.getOwnPropertyDescriptor(HTMLIFrameElement.prototype, 'contentWindow');
+        if (origDesc && origDesc.get) {
+            Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+                get: function() {
+                    const w = origDesc.get.call(this);
+                    if (w === null && this.src && this.src.startsWith('about:')) return w;
+                    return w;
+                },
+            });
+        }
+    } catch (_) {}
+})();
+"""
+
+
+def _setup_request_interception(context: Any) -> None:
+    """Intercept outgoing requests to fix headers that reveal automation.
+
+    Playwright's Chromium adds ``Sec-CH-UA`` headers that may contain
+    ``HeadlessChrome`` or other automation markers.  This replaces them with
+    values a normal Chrome installation sends, and strips headers that only
+    appear in automated contexts.
+    """
+    def _route_handler(route: Any) -> None:
+        try:
+            headers = dict(route.request.headers)
+            # Fix Sec-CH-UA to look like a normal Chrome.
+            ua = headers.get("user-agent", "")
+            if "HeadlessChrome" in ua:
+                headers["user-agent"] = ua.replace("HeadlessChrome", "Chrome")
+            # Provide realistic Client Hints.
+            if "sec-ch-ua" in headers:
+                # Replace with a plausible Chrome value.
+                headers["sec-ch-ua"] = '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"'
+            if "sec-ch-ua-platform" in headers:
+                headers["sec-ch-ua-platform"] = '"Linux"'
+            if "sec-ch-ua-mobile" in headers:
+                headers["sec-ch-ua-mobile"] = "?0"
+            # Remove headers that betray automation.
+            for h in ("sec-ch-ua-full-version-list", "sec-ch-ua-wow64",
+                       "sec-ch-ua-bitness", "sec-ch-ua-arch", "sec-ch-ua-model"):
+                headers.pop(h, None)
+            route.continue_(headers=headers)
+        except Exception:
+            try:
+                route.continue_()
+            except Exception:
+                pass
+
+    try:
+        context.route("**/*", _route_handler)
+    except Exception as exc:
+        LOG.debug("Request interception setup failed (non-fatal): %s", exc)
+
+
 def chrome_executable(config: dict[str, Any]) -> str:
     """Path of the Chrome the service uses, for launching it without automation."""
     explicit = str(config["browser"].get("executable_path", "")).strip()
@@ -1388,10 +1847,15 @@ def chrome_page(config: dict[str, Any], *, use_session: bool = True):
                 browser = playwright.chromium.launch_persistent_context(
                     profile, locale="zh-TW", timezone_id=config["schedule"]["timezone"], **launch_options,
                 )
+                browser.add_init_script(_STEALTH_INIT_SCRIPT)
+                _setup_request_interception(browser)
                 page = browser.pages[0] if browser.pages else browser.new_page()
             else:
                 browser = playwright.chromium.launch(**launch_options)
-                page = _new_context(browser, config, use_session=use_session).new_page()
+                context = _new_context(browser, config, use_session=use_session)
+                context.add_init_script(_STEALTH_INIT_SCRIPT)
+                _setup_request_interception(context)
+                page = context.new_page()
             with _SESSION_LOCK:
                 _page_session_generation[id(page)] = _session_generation
             try:
